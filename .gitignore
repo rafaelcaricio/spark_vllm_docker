@@ -28,3 +28,10 @@ experiments/dspark_harness/.venv/
 experiments/dspark_harness/.pytest_cache/
 experiments/dspark_harness/.hypothesis/
 experiments/dspark_harness/**/__pycache__/
+
+# DSpark benchmark generated artifacts
+experiments/dspark-benchmarks/*.json
+experiments/dspark-benchmarks/*.metrics.before.txt
+experiments/dspark-benchmarks/*.metrics.after.txt
+experiments/dspark-benchmarks/*.log
+models/

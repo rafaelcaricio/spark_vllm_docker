@@ -16,7 +16,7 @@ from transformers import AutoTokenizer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://127.0.0.1:8010")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="deepseek-v4-flash-dspark")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--prompt-tokens", type=int, default=200_000)
@@ -93,6 +93,38 @@ def metric_delta(before: str, after: str) -> dict[str, Any]:
             accepted_per_pos[position] = after_value - before_value
     delta["spec_decode_accepted_per_pos"] = accepted_per_pos
     return delta
+
+
+def dspark_quality_summary(metrics_delta: dict[str, Any]) -> dict[str, Any]:
+    drafts = float(metrics_delta.get("spec_decode_num_drafts") or 0.0)
+    draft_tokens = float(metrics_delta.get("spec_decode_draft_tokens") or 0.0)
+    accepted_tokens = float(
+        metrics_delta.get("spec_decode_accepted_tokens") or 0.0
+    )
+    accepted_per_pos = metrics_delta.get("spec_decode_accepted_per_pos") or {}
+
+    per_position_acceptance = {
+        str(position): (float(count) / drafts if drafts > 0.0 else None)
+        for position, count in sorted(
+            accepted_per_pos.items(),
+            key=lambda item: int(item[0]),
+        )
+    }
+    return {
+        "drafts": drafts,
+        "draft_tokens": draft_tokens,
+        "accepted_tokens": accepted_tokens,
+        "draft_tokens_per_draft": (
+            draft_tokens / drafts if drafts > 0.0 else None
+        ),
+        "accepted_tokens_per_draft": (
+            accepted_tokens / drafts if drafts > 0.0 else None
+        ),
+        "acceptance_rate": (
+            accepted_tokens / draft_tokens if draft_tokens > 0.0 else None
+        ),
+        "per_position_acceptance": per_position_acceptance,
+    }
 
 
 def server_max_model_len(base_url: str, model: str) -> int | None:
@@ -236,6 +268,7 @@ def main() -> None:
     stream = post_stream_chat(base_url, payload, timeout=args.timeout)
     metrics_after = http_get_text(base_url + "/metrics", timeout=10.0)
     metrics_delta = metric_delta(metrics_before, metrics_after)
+    quality_summary = dspark_quality_summary(metrics_delta)
 
     output_ids = tokenizer.encode(stream["text"], add_special_tokens=False)
     output_tokens = len(output_ids)
@@ -278,6 +311,7 @@ def main() -> None:
             output_tokens / (end - start) if end > start else None
         ),
         "metrics_delta": metrics_delta,
+        "dspark_quality": quality_summary,
         "health": health.strip(),
         "metrics_before_interesting": interesting_metrics(metrics_before),
         "metrics_after_interesting": interesting_metrics(metrics_after),
