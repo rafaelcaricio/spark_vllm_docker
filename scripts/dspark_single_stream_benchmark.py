@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-tokens", type=int, default=200_000)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--timeout", type=float, default=7200.0)
     parser.add_argument("--output-json", default="")
     return parser.parse_args()
@@ -44,6 +45,65 @@ def interesting_metrics(raw: str) -> list[str]:
         if "spec" in lowered or "draft" in lowered or "dspark" in lowered:
             lines.append(line)
     return lines[:200]
+
+
+def metric_values(raw: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for line in raw.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            key, value = line.rsplit(" ", 1)
+            values[key] = float(value)
+        except ValueError:
+            continue
+    return values
+
+
+def metric_sum(values: dict[str, float], name: str) -> float:
+    return sum(value for key, value in values.items() if key.startswith(name))
+
+
+def metric_delta(before: str, after: str) -> dict[str, Any]:
+    before_values = metric_values(before)
+    after_values = metric_values(after)
+    delta: dict[str, Any] = {}
+    for result_key, metric_name in (
+        ("spec_decode_num_drafts", "vllm:spec_decode_num_drafts_total"),
+        ("spec_decode_draft_tokens", "vllm:spec_decode_num_draft_tokens_total"),
+        ("spec_decode_accepted_tokens",
+         "vllm:spec_decode_num_accepted_tokens_total"),
+        ("prompt_tokens", "vllm:prompt_tokens_total"),
+        ("generation_tokens", "vllm:generation_tokens_total"),
+    ):
+        delta[result_key] = metric_sum(after_values, metric_name) - metric_sum(
+            before_values, metric_name)
+
+    accepted_per_pos: dict[str, float] = {}
+    prefix = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+    for key, after_value in after_values.items():
+        if not key.startswith(prefix):
+            continue
+        before_value = before_values.get(key, 0.0)
+        marker = 'position="'
+        if marker in key:
+            position = key.split(marker, 1)[1].split('"', 1)[0]
+            accepted_per_pos[position] = after_value - before_value
+    delta["spec_decode_accepted_per_pos"] = accepted_per_pos
+    return delta
+
+
+def server_max_model_len(base_url: str, model: str) -> int | None:
+    raw = http_get_text(base_url.rstrip("/") + "/v1/models", timeout=10.0)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    for entry in payload.get("data", []):
+        if entry.get("id") == model:
+            max_len = entry.get("max_model_len")
+            return int(max_len) if max_len is not None else None
+    return None
 
 
 def chat_token_count(tokenizer: Any, content: str) -> int:
@@ -161,8 +221,11 @@ def main() -> None:
         "temperature": args.temperature,
         "stream": True,
     }
+    if args.ignore_eos:
+        payload["ignore_eos"] = True
     stream = post_stream_chat(base_url, payload, timeout=args.timeout)
     metrics_after = http_get_text(base_url + "/metrics", timeout=10.0)
+    metrics_delta = metric_delta(metrics_before, metrics_after)
 
     output_ids = tokenizer.encode(stream["text"], add_special_tokens=False)
     output_tokens = len(output_ids)
@@ -177,24 +240,32 @@ def main() -> None:
     decode_tps = None
     if decode_elapsed and decode_elapsed > 0:
         decode_tps = max(output_tokens - 1, 0) / decode_elapsed
+    server_decode_tps = None
+    generation_tokens_delta = metrics_delta.get("generation_tokens")
+    if decode_elapsed and decode_elapsed > 0 and generation_tokens_delta:
+        server_decode_tps = max(generation_tokens_delta - 1, 0) / decode_elapsed
 
     result = {
         "model": args.model,
         "base_url": base_url,
         "prompt_tokens_local": prompt_tokens,
         "target_prompt_tokens": args.prompt_tokens,
+        "served_max_model_len": server_max_model_len(base_url, args.model),
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "ignore_eos": args.ignore_eos,
         "output_tokens_local": output_tokens,
         "stream_chunks": stream["chunk_count"],
         "time_to_first_content_s": ttft,
         "time_to_first_byte_s": first_byte_latency,
         "decode_elapsed_after_first_content_s": decode_elapsed,
         "decode_tokens_per_second_approx": decode_tps,
+        "decode_tokens_per_second_server_metrics": server_decode_tps,
         "end_to_end_elapsed_s": end - start,
         "end_to_end_output_tokens_per_second": (
             output_tokens / (end - start) if end > start else None
         ),
+        "metrics_delta": metrics_delta,
         "health": health.strip(),
         "metrics_before_interesting": interesting_metrics(metrics_before),
         "metrics_after_interesting": interesting_metrics(metrics_after),
