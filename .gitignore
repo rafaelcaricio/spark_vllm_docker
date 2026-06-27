@@ -1,5 +1,6 @@
 .env
 .cache/
+cache/
 *.log
 docker-compose.override.yml
 __pycache__/
@@ -21,3 +22,9 @@ benchmarks/results/bt-matrix/analysis-*.md
 benchmarks/results/bt-matrix/logs/
 benchmarks/results/bt-matrix/.validate-*/
 benchmarks/results/bt-matrix/.preflight-*/
+
+# DSpark harness generated state
+experiments/dspark_harness/.venv/
+experiments/dspark_harness/.pytest_cache/
+experiments/dspark_harness/.hypothesis/
+experiments/dspark_harness/**/__pycache__/

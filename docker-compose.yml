@@ -138,7 +138,7 @@ services:
               capabilities: [gpu]
     shm_size: "64gb"
     volumes:
-      - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
+      - ${MODEL_MOUNT_PATH:-${MODEL_PATH}}:${MODEL_MOUNT_CONTAINER_PATH:-${MODEL_CONTAINER_PATH}}:${MODEL_MOUNT_MODE:-ro}
       - ./.cache/vllm:/root/.cache/vllm
       - ./cache/triton:/root/.triton
       - ./cache/unholy-jit:/cache/jit
@@ -285,7 +285,7 @@ services:
               capabilities: [gpu]
     shm_size: "64gb"
     volumes:
-      - ${MODEL_PATH}:${MODEL_CONTAINER_PATH}:ro
+      - ${MODEL_MOUNT_PATH:-${MODEL_PATH}}:${MODEL_MOUNT_CONTAINER_PATH:-${MODEL_CONTAINER_PATH}}:${MODEL_MOUNT_MODE:-ro}
       - ./.cache/vllm:/root/.cache/vllm
       - ./cache/triton:/root/.triton
       - ./cache/unholy-jit:/cache/jit

@@ -41,6 +41,15 @@ mkdir -p "${DG_JIT_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}
 : "${GPU_MEMORY_UTILIZATION:=0.80}"
 : "${MTP_NUM_TOKENS:=1}"
 
+# The base compose exports optional VLLM_* knobs as empty strings when unset.
+# This unholy-fusion vLLM build parses some of those envs during VllmConfig
+# construction, so empty strings can trip type conversion. Treat empty as unset.
+for _vllm_env in $(compgen -e VLLM_); do
+  if [ -z "${!_vllm_env}" ]; then
+    unset "${_vllm_env}"
+  fi
+done
+
 # Enforce mp-only — Ray is not available in the aidendle94 conda environment.
 if [ "${DISTRIBUTED_BACKEND}" != "mp" ]; then
   echo "[unholy] ERROR: unholy-fusion integration is mp-only; set DISTRIBUTED_BACKEND=mp" >&2
