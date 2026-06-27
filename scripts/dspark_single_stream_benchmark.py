@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--prompt-suffix", default="")
+    parser.add_argument("--cache-salt", default="")
     parser.add_argument("--timeout", type=float, default=7200.0)
     parser.add_argument("--output-json", default="")
     return parser.parse_args()
@@ -119,16 +121,21 @@ def chat_token_count(tokenizer: Any, content: str) -> int:
         return len(tokenizer.encode(content, add_special_tokens=False))
 
 
-def build_prompt(tokenizer: Any, target_tokens: int) -> tuple[str, int]:
+def build_prompt(tokenizer: Any, target_tokens: int,
+                 prompt_suffix: str = "") -> tuple[str, int]:
     unit = (
         "Long-context benchmark fact: DSpark speculative decoding validates "
         "draft tokens against the target model while using target-layer hidden "
         "features, Markov correction, and confidence estimates. "
     )
+    if prompt_suffix:
+        unit = f"Profile run marker {prompt_suffix}. " + unit
     tail = (
         "\n\nUse the preceding repeated benchmark facts as inert context. "
         "Answer in one concise sentence: confirm the context was received."
     )
+    if prompt_suffix:
+        tail += f"\n\nProfile run marker: {prompt_suffix}"
 
     low = 0
     high = max(1, target_tokens // 4)
@@ -208,7 +215,8 @@ def post_stream_chat(
 def main() -> None:
     args = parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    prompt, prompt_tokens = build_prompt(tokenizer, args.prompt_tokens)
+    prompt, prompt_tokens = build_prompt(tokenizer, args.prompt_tokens,
+                                         args.prompt_suffix)
 
     base_url = args.base_url.rstrip("/")
     health = http_get_text(base_url + "/health", timeout=10.0)
@@ -223,6 +231,8 @@ def main() -> None:
     }
     if args.ignore_eos:
         payload["ignore_eos"] = True
+    if args.cache_salt:
+        payload["cache_salt"] = args.cache_salt
     stream = post_stream_chat(base_url, payload, timeout=args.timeout)
     metrics_after = http_get_text(base_url + "/metrics", timeout=10.0)
     metrics_delta = metric_delta(metrics_before, metrics_after)
@@ -254,6 +264,8 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "ignore_eos": args.ignore_eos,
+        "prompt_suffix": args.prompt_suffix,
+        "cache_salt": args.cache_salt,
         "output_tokens_local": output_tokens,
         "stream_chunks": stream["chunk_count"],
         "time_to_first_content_s": ttft,
