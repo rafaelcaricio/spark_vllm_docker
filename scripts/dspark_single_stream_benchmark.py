@@ -102,14 +102,30 @@ def dspark_quality_summary(metrics_delta: dict[str, Any]) -> dict[str, Any]:
         metrics_delta.get("spec_decode_accepted_tokens") or 0.0
     )
     accepted_per_pos = metrics_delta.get("spec_decode_accepted_per_pos") or {}
-
-    per_position_acceptance = {
-        str(position): (float(count) / drafts if drafts > 0.0 else None)
+    accepted_counts_by_pos = {
+        str(position): float(count)
         for position, count in sorted(
             accepted_per_pos.items(),
             key=lambda item: int(item[0]),
         )
     }
+
+    per_position_acceptance = {
+        position: (count / drafts if drafts > 0.0 else None)
+        for position, count in accepted_counts_by_pos.items()
+    }
+    conditional_acceptance: dict[str, float | None] = {}
+    previous_denominator = drafts
+    for position, count in accepted_counts_by_pos.items():
+        conditional_acceptance[position] = (
+            count / previous_denominator if previous_denominator > 0.0 else None
+        )
+        previous_denominator = count
+    suffix_values = [
+        value
+        for position, value in conditional_acceptance.items()
+        if int(position) > 0 and value is not None
+    ]
     return {
         "drafts": drafts,
         "draft_tokens": draft_tokens,
@@ -124,6 +140,11 @@ def dspark_quality_summary(metrics_delta: dict[str, Any]) -> dict[str, Any]:
             accepted_tokens / draft_tokens if draft_tokens > 0.0 else None
         ),
         "per_position_acceptance": per_position_acceptance,
+        "conditional_acceptance_per_position": conditional_acceptance,
+        "first_token_acceptance": conditional_acceptance.get("0"),
+        "mean_suffix_conditional_acceptance": (
+            sum(suffix_values) / len(suffix_values) if suffix_values else None
+        ),
     }
 
 

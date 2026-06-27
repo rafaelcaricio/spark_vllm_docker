@@ -26,10 +26,18 @@ optimized or better graph-captured.
   prompt buckets, padded speculative prep, and rejection sampling:
   `78.86` server decode tok/s mean, `1.06%` CV, `56.42%` draft acceptance,
   `2.82` accepted tokens per draft.
+- Fast draft-output path, threshold off, clean rebuilt runtime image:
+  `72.68` server decode tok/s mean, `23.88%` CV, `52.49%` draft acceptance,
+  `2.62` accepted tokens per draft. This reduced returned-logit/confidence
+  work and graph memory but did not improve the speed gate.
 - Interpretation: the main draft-quality issue was not confidence thresholding.
   vLLM's padded speculative path forwards rejected verification suffixes through
   the target model, and DSpark must not cache those hidden states as accepted
   target context.
+- Paper-refresh interpretation: in steady runs, position-wise conditional
+  acceptance does not show DFlash-like suffix collapse. The next acceptance
+  breakthrough is more likely first-token draft quality or reference numeric
+  parity than tail pruning alone.
 
 ## Implemented In This Pass
 
@@ -122,6 +130,45 @@ Log evidence after JIT monitor activation:
 - No route-pack JIT repeated in runs 2 or 3; despite the run-1 compile, the
   three-run throughput is now repeatable.
 
+## Fast Draft-Output Benchmark
+
+Configuration is the same as the real-model benchmark above. Results from
+`single_stream_interactive_262k_window_fastoutputs_20260627_234455_run*.json`:
+
+| run | server tok/s | draft acceptance | accepted / draft |
+| --- | ---: | ---: | ---: |
+| 1 | `87.54` | `65.00%` | `3.25` |
+| 2 | `48.33` | `31.52%` | `1.58` |
+| 3 | `82.17` | `60.95%` | `3.05` |
+
+Aggregate:
+
+- Server decode speed: `72.68` tok/s mean, `17.36` stdev, `23.88%` CV.
+- Draft acceptance: `52.49%` mean.
+- Accepted tokens per draft: `2.62` mean.
+- Improvement versus the `72.87` tok/s rejected-context-trim baseline:
+  `-0.26%`; this does not clear the `91.09` tok/s speed gate.
+- Graph memory evidence improved: startup estimated CUDA graph memory fell
+  from about `0.33 GiB` before the fast-output path to `0.17 GiB` after it.
+
+Position-wise conditional acceptance, computed from the same prefix-survival
+counter shape used in the DSpark paper:
+
+| run | pos0 | pos1 | pos2 | pos3 | pos4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | `81.67%` | `89.80%` | `86.36%` | `86.84%` | `93.94%` |
+| 2 | `58.59%` | `67.24%` | `61.54%` | `79.17%` | `84.21%` |
+| 3 | `77.78%` | `87.76%` | `86.05%` | `91.89%` | `85.29%` |
+
+Mean conditional acceptance: `[72.68%, 81.60%, 77.98%, 85.97%, 87.81%]`.
+Run 2 is mostly a first-token acceptance failure, not monotonic suffix decay.
+
+Invalid kernel experiment:
+
+- `_DSPARK_SCORE_K_BLOCK=16` was tested on the real model and rejected.
+- Three measured runs produced near-zero accepted drafts (`0`, `0`, `1`
+  accepted tokens), so the score block was restored to `8`.
+
 ## Verification
 
 - Passed: `uv run pytest --hypothesis-show-statistics -q` in
@@ -137,6 +184,9 @@ Log evidence after JIT monitor activation:
 - Passed: clean rebuilt experimental container after warmup expansion; `/health`
   returned 200 on `0.0.0.0:8000`; benchmark repeated 3 times and recorded
   `78.86` server decode tok/s mean.
+- Passed: clean rebuilt fast-output container; `/health` returned 200 on
+  `0.0.0.0:8000`; benchmark repeated 3 times and recorded `72.68` server
+  decode tok/s mean. This is correctness/graph-memory progress, not a speed win.
 - Passed: benchmark script AST parse and `dspark_quality_summary` smoke test.
 - Blocked on the host: direct vLLM pytest import needs compiled `vllm._C`; this
   checkout's local uv venv has Python deps but not built vLLM CUDA extensions.
@@ -150,10 +200,17 @@ Log evidence after JIT monitor activation:
   reference parity requires sampling each Markov-corrected step left-to-right
   with the request sampling temperature, while retaining the corrected logits
   as draft probabilities for standard rejection sampling.
+- The DeepSpec paper and released model card both evaluate or recommend
+  `temperature=1.0`; the current speed benchmark is greedy
+  `temperature=0.0`, which intentionally avoids draft-probability export.
 - DSpark draft KV numeric parity does not reproduce the released reference's
   in-place FP8 quant-dequant on the no-RoPE KV slice. This may affect exact
   logit parity but should be profiled before enabling because a Python fallback
   would slow decode.
+- Confidence scheduling currently receives already-sigmoided probabilities
+  from the model wrapper. The paper's STS calibration is a logit-space
+  temperature-scaling procedure; if calibration scalars become available, apply
+  them before sigmoid.
 - DSpark confidence scheduling is static-threshold based. The paper uses
   calibrated cumulative survival and hardware-aware capacity ranking.
 - Variable-prefix scheduling is CPU/shape-management heavy enough that the
@@ -174,6 +231,11 @@ Log evidence after JIT monitor activation:
 
 ## Custom Kernel Opportunities
 
+- Reference-parity probe for DSpark draft KV `act_quant(..., inplace=True)` on
+  no-RoPE dimensions, preferably fused into sparse attention or KV projection.
+  This is now a draft-quality candidate, not just a numeric cleanup.
+- GPU-side first-token quality diagnostics: record draft/target top-1 agreement
+  and confidence for position 0 without full-vocabulary softmax in hot runs.
 - GPU-side confidence prefix selection and draft-length packing to remove CPU
   scheduling and route-packing overhead.
 - Bucketed or graph-captured variable-prefix verification paths for lengths
@@ -200,8 +262,9 @@ Log evidence after JIT monitor activation:
 
 ## Next Step
 
-Keep the rejected-context trim and expanded warmups as the current speed
-baseline, then target the remaining one-time JITs with runtime-shape tracing.
-After that, move DSpark context trimming and draft-length routing onto GPU and
-graph-capture the hot single-stream draft path so the quality gain is not
-diluted by CPU synchronization and dynamic shape management.
+Use the paper-style conditional acceptance metric as the next gate. First, add
+or run a low-overhead position-0 diagnostic to separate hard-content first-token
+misses from reference-parity misses. Then test the highest-probability
+reference-parity fix, draft KV in-place FP8 quant-dequant on the no-RoPE slice,
+behind a flag. Keep only changes that improve repeated real-model decode mean
+toward the `91.09` tok/s gate.
