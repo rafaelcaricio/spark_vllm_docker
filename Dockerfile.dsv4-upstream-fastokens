@@ -1,0 +1,181 @@
+# syntax=docker/dockerfile:1.6
+# =========================================================================
+# vLLM on NVIDIA DGX Spark (GB10, SM121) -- DeepSeek-V4-Flash
+# upstream vLLM + fastokens experiment
+#
+# Stack:
+#   FROM ghcr.io/bjk110/vllm-spark:v022-d568
+#     (NGC 26.04 / PyTorch 2.12.0a0 / FlashInfer 0.6.11.post3
+#      / Triton 3.7.0 / NCCL 2.30.4 / Transformers 5.8.1)
+#   + vllm-project/vllm @ 2616f67faaa735a3 (upstream main, 2026-05-27)
+#   + fastokens >= 0.2.0, enabled at runtime with VLLM_USE_FASTOKENS=1
+#   + DSV4 compatibility and GB10 fused-MoE config restaging from this repo
+#
+# This is intentionally separate from Dockerfile.dsv4-d568, which remains the
+# validated jasl/vllm path documented in docs/dsv4-flash-tp2.md.
+# =========================================================================
+
+ARG NGC_TAG=26.04-py3
+ARG BUILD_JOBS=16
+
+# Upstream vLLM pin. Bump intentionally when re-testing the experiment.
+ARG VLLM_REPO_URL=https://github.com/vllm-project/vllm.git
+ARG VLLM_BRANCH=main
+ARG VLLM_COMMIT=2616f67faaa735a3e0d9c17968fa91f242d36c56
+ARG DEEPGEMM_COMMIT=714dd1a4a980f7937a74343d19a8eba4fe321480
+
+ARG TORCH_CUDA_ARCH="12.1a"
+
+# =========================================================================
+# STAGE 1: vLLM Builder (upstream vLLM)
+#
+# Rebuild against NGC 26.04 so the wheel ABI matches the v022-d568 runner.
+# Compatibility patches are applied defensively and skip when already absorbed.
+# =========================================================================
+FROM nvcr.io/nvidia/pytorch:${NGC_TAG} AS vllm-builder
+
+ARG BUILD_JOBS
+ARG VLLM_REPO_URL
+ARG VLLM_BRANCH
+ARG VLLM_COMMIT
+ARG TORCH_CUDA_ARCH
+ENV MAX_JOBS=${BUILD_JOBS} \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH} \
+    PATH=/usr/lib/ccache:$PATH \
+    CCACHE_DIR=/root/.ccache \
+    CCACHE_MAXSIZE=50G \
+    CCACHE_COMPRESS=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ninja-build ccache cargo rustc && \
+    rm -rf /var/lib/apt/lists/*
+
+# Clone upstream vLLM and pin to exact commit.
+RUN git clone ${VLLM_REPO_URL} /workspace/vllm-src && \
+    cd /workspace/vllm-src && \
+    git fetch origin ${VLLM_BRANCH} && \
+    git checkout ${VLLM_COMMIT} && \
+    ACTUAL=$(git rev-parse HEAD) && \
+    echo "vLLM pinned to: ${ACTUAL} (vllm upstream @ ${VLLM_BRANCH})" && \
+    echo "${ACTUAL}" | grep -q "^${VLLM_COMMIT}" || \
+      (echo "FATAL: commit mismatch — expected ${VLLM_COMMIT}*, got ${ACTUAL}" && exit 1) && \
+    git config user.email "build@vllm-spark.local" && \
+    git config user.name "vllm-spark builder"
+
+# Apply packed_modules_mapping patch -- defensive (skips if already present upstream).
+COPY patches/apply_dsv4_packed_mapping.py /tmp/apply_dsv4_packed_mapping.py
+RUN python3 /tmp/apply_dsv4_packed_mapping.py \
+      /workspace/vllm-src/vllm/model_executor/models/deepseek_v4.py || \
+    echo "[patch] packed_mapping skipped (anchor not found — likely already in upstream)"
+
+# PyTorch 2.11/2.12-alpha compat: strip hoist=True kwarg from register_opaque_type().
+COPY patches/fix_pytorch211_compat.py /tmp/fix_pytorch211_compat.py
+RUN cd /workspace/vllm-src && python3 /tmp/fix_pytorch211_compat.py || \
+    echo "[patch] fix_pytorch211_compat not applicable on upstream"
+
+RUN pip install -q setuptools setuptools-scm setuptools-rust ninja cmake wheel packaging
+
+# Build vLLM wheel
+RUN --mount=type=cache,id=ccache-dsv4-upstream-fastokens,target=/root/.ccache \
+    cd /workspace/vllm-src && \
+    SETUPTOOLS_SCM_PRETEND_VERSION="0.22.0.dev" \
+    VLLM_TARGET_DEVICE=cuda \
+    python3 setup.py bdist_wheel -d /workspace/wheels && \
+    ls -lh /workspace/wheels/*.whl && \
+    echo "[vllm] Wheel built"
+
+
+# =========================================================================
+# STAGE 2: Runner (inherit v022-d568 — FlashInfer / Triton / NCCL / Transformers
+# all preinstalled). Only swap vLLM and add DSV4-specific bits.
+# =========================================================================
+FROM ghcr.io/bjk110/vllm-spark:v022-d568 AS runner
+
+LABEL org.opencontainers.image.source="https://github.com/bjk110/spark_vllm_docker"
+LABEL org.opencontainers.image.description="vLLM upstream main @ 2616f67faaa735a3 + fastokens on v022-d568 for DeepSeek-V4-Flash experiment on DGX Spark GB10"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+ARG DEEPGEMM_COMMIT
+ARG TORCH_CUDA_ARCH=12.1a
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH}
+
+# Uninstall the v022-d568 vLLM (0.21.0+PR#35568) before installing the upstream wheel.
+RUN pip uninstall -y vllm 2>/dev/null || true
+
+# Install upstream vLLM wheel.
+RUN --mount=type=bind,from=vllm-builder,source=/workspace/wheels,target=/mount/vllm \
+    pip install /mount/vllm/*.whl --no-deps && \
+    python3 -c "import vllm; print(f'[vllm] {vllm.__version__} installed')" && \
+    python3 -c "from pathlib import Path; \
+      so = Path('/usr/local/lib/python3.12/dist-packages/vllm/_C_stable_libtorch.abi3.so'); \
+      assert so.exists(), f'{so} not found'; \
+      print(f'_C_stable_libtorch.abi3.so: {so.stat().st_size/1e6:.1f} MB')"
+
+# Re-resolve runtime deps (upstream may declare new requirements).
+RUN --mount=type=cache,id=uv-dsv4-upstream-fastokens,target=/root/.cache/uv \
+    DEPS=$(pip show vllm 2>/dev/null | grep ^Requires | sed 's/Requires: //' | tr ',' '\n' | \
+      sed 's/^ *//;s/ *$//' | grep -v -E '^(torch|torchvision|torchaudio|flashinfer|$)' | \
+      tr '\n' ' ') && \
+    uv pip install --system $DEPS || \
+    echo "[deps] partial resolve — runtime imports will surface anything critical"
+
+# instanttensor — listed in eugr/spark-vllm-docker PR #219 recipe.
+# Available on PyPI. Tolerated to fail: fastsafetensors (already installed
+# on the base image) is sufficient as a loader fallback.
+RUN --mount=type=cache,id=uv-dsv4-upstream-fastokens,target=/root/.cache/uv \
+    (uv pip install --system instanttensor && \
+     echo "[deps] instanttensor installed") || \
+    echo "[deps] instanttensor unavailable — recipe still works via fastsafetensors"
+
+# DeepGEMM is required by upstream vLLM's DSV4 sparse-attention indexer.
+# The PyPI sdist omits CUTLASS, so install from a pinned source checkout with submodules.
+RUN --mount=type=cache,id=deepgemm-git-dsv4-upstream,target=/root/.cache/deepgemm-git \
+    git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git /tmp/deepgemm && \
+    cd /tmp/deepgemm && \
+    git checkout ${DEEPGEMM_COMMIT} && \
+    git submodule update --init --recursive && \
+    python3 -m pip install . --no-build-isolation --no-cache-dir && \
+    cd / && \
+    rm -rf /tmp/deepgemm && \
+    python3 -c "import deep_gemm; print(f'[deps] deep_gemm installed: {deep_gemm.__file__}')"
+
+# fastokens Rust BPE backend. Runtime opt-in via VLLM_USE_FASTOKENS=1;
+# keep --tokenizer-mode deepseek_v4 for DSV4 chat-template handling.
+RUN --mount=type=cache,id=uv-dsv4-upstream-fastokens,target=/root/.cache/uv \
+    uv pip install --system "fastokens>=0.2.0" && \
+    python3 -c "import fastokens; print('[deps] fastokens installed')"
+
+# PyTorch 2.12.0a0 compat: vLLM's `is_torch_equal_or_newer("2.12.0.dev")` returns True
+# on NGC 26.04 PyTorch alpha, but that alpha predates the upstream `split_module(tuple_return=...)`
+# commit. This patch swaps the static version check for a runtime signature probe.
+# The v022-d568 base had this applied to its bundled vLLM, but we just replaced vLLM
+# with the upstream wheel — re-apply to the new install.
+COPY patches/patch_split_module_compat.py /tmp/patch_split_module_compat.py
+RUN python3 /tmp/patch_split_module_compat.py
+
+# Restore the GB10-tuned fused-MoE configs that were placed by the base image's
+# vLLM install (the path now points at the freshly installed upstream wheel).
+COPY patches/moe_config_e256.json \
+     /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_GB10,dtype=fp8_w8a8,block_shape=[128,128].json
+COPY patches/moe_config_e512.json \
+     /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/configs/E=512,N=512,device_name=NVIDIA_GB10,dtype=fp8_w8a8,block_shape=[128,128].json
+
+# Confirm DSV4 architecture registration after install (transformers + vllm).
+RUN python3 -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES; \
+                assert 'deepseek_v4' in CONFIG_MAPPING_NAMES, \
+                  'deepseek_v4 not in transformers — bump TRANSFORMERS_VER on the base image'; \
+                print('[transformers] deepseek_v4 config available')" && \
+    python3 -c "from vllm.model_executor.models import ModelRegistry; \
+                supported = ModelRegistry.get_supported_archs(); \
+                assert 'DeepseekV4ForCausalLM' in supported, \
+                  f'DeepseekV4ForCausalLM not in vLLM ModelRegistry: {sorted(supported)[:20]}...'; \
+                print('[vllm] DeepseekV4ForCausalLM registered')"
+
+# Re-run verification script.
+RUN /opt/scripts/verify_imports.py 2>/dev/null && \
+    echo "[verify] dsv4-upstream-fastokens build-time checks passed" || \
+    echo "[verify] WARN: verify_imports.py reported issues (may be DSV4-specific imports unavailable until GPU)"
+
+EXPOSE 8000

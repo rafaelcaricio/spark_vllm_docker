@@ -34,4 +34,10 @@ experiments/dspark-benchmarks/*.json
 experiments/dspark-benchmarks/*.metrics.before.txt
 experiments/dspark-benchmarks/*.metrics.after.txt
 experiments/dspark-benchmarks/*.log
+experiments/dspark-benchmarks/*.stdout.txt
+experiments/dspark-benchmarks/profiles/
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
 models/

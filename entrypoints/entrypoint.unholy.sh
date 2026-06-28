@@ -133,6 +133,13 @@ print("[unholy-patch] patch2 (determine_available_memory) applied to " + target)
 PYPATCH2
 fi
 
+EXTRA_ARGS=()
+if [ -n "${VLLM_EXTRA_ARGS:-}" ]; then
+  # Experimental-only escape hatch for vLLM CLI flags. Keep values simple:
+  # whitespace-delimited flags are supported, shell quoting is intentionally not.
+  read -r -a EXTRA_ARGS <<< "${VLLM_EXTRA_ARGS}"
+fi
+
 # ── ROLE=worker dispatch ─────────────────────────────────────────────────────
 if [ "${ROLE}" = "worker" ]; then
   : "${NODE_RANK:=1}"
@@ -162,7 +169,8 @@ if [ "${ROLE}" = "worker" ]; then
     --node-rank "${NODE_RANK}" \
     --master-addr "${HEAD_ROCE_IP}" \
     --master-port "${MASTER_PORT:-25000}" \
-    --headless
+    --headless \
+    "${EXTRA_ARGS[@]}"
 fi
 
 # ── ROLE=head ─────────────────────────────────────────────────────────────────
@@ -192,4 +200,5 @@ exec vllm serve "${MODEL_CONTAINER_PATH}" \
   --nnodes 2 \
   --node-rank "${NODE_RANK}" \
   --master-addr "${HEAD_ROCE_IP}" \
-  --master-port "${MASTER_PORT:-25000}"
+  --master-port "${MASTER_PORT:-25000}" \
+  "${EXTRA_ARGS[@]}"

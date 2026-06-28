@@ -23,8 +23,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument(
+        "--endpoint",
+        choices=("chat", "completion"),
+        default="chat",
+        help="Use chat completions or raw text completions.",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=("context_confirm", "code_completion"),
+        default="context_confirm",
+        help="Prompt shape to benchmark.",
+    )
+    parser.add_argument(
+        "--thinking",
+        choices=("default", "true", "false"),
+        default="default",
+        help=(
+            "Override DeepSeek chat-template thinking mode. The DSpark paper "
+            "evaluates non-thinking mode."
+        ),
+    )
     parser.add_argument("--prompt-suffix", default="")
+    parser.add_argument(
+        "--stable-prompt",
+        action="store_true",
+        help=(
+            "Keep the visible prompt fixed even when --prompt-suffix is set. "
+            "Use --cache-salt for per-run cache isolation."
+        ),
+    )
     parser.add_argument("--cache-salt", default="")
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help="Send and discard this many requests before measuring metrics/time.",
+    )
     parser.add_argument("--timeout", type=float, default=7200.0)
     parser.add_argument("--output-json", default="")
     return parser.parse_args()
@@ -161,7 +196,10 @@ def server_max_model_len(base_url: str, model: str) -> int | None:
     return None
 
 
-def chat_token_count(tokenizer: Any, content: str) -> int:
+def prompt_token_count(tokenizer: Any, content: str, *, endpoint: str) -> int:
+    if endpoint == "completion":
+        return len(tokenizer.encode(content, add_special_tokens=False))
+
     messages = [{"role": "user", "content": content}]
     try:
         token_ids = tokenizer.apply_chat_template(
@@ -174,8 +212,32 @@ def chat_token_count(tokenizer: Any, content: str) -> int:
         return len(tokenizer.encode(content, add_special_tokens=False))
 
 
-def build_prompt(tokenizer: Any, target_tokens: int,
-                 prompt_suffix: str = "") -> tuple[str, int]:
+def scenario_parts(scenario: str, prompt_suffix: str) -> tuple[str, str]:
+    if scenario == "code_completion":
+        marker = f"# Profile run marker: {prompt_suffix}\n" if prompt_suffix else ""
+        unit = (
+            marker
+            + "# DSpark decode benchmark helper.\n"
+            + "def acceptance_case(seed: int) -> tuple[str, int, int]:\n"
+            + "    label = f\"case_{seed:04d}\"\n"
+            + "    draft_tokens = 5\n"
+            + "    accepted_tokens = 4 if seed % 7 else 5\n"
+            + "    return label, accepted_tokens, draft_tokens\n\n"
+            + "def expected_speedup(seed: int) -> float:\n"
+            + "    _label, accepted, drafted = acceptance_case(seed)\n"
+            + "    return (accepted + 1) / max(drafted, 1)\n\n"
+        )
+        tail = (
+            "\n# Continue this pytest module with deterministic checks. "
+            "Output Python code only.\n\n"
+            "def test_dspark_prefix_scheduler_keeps_fast_path_hot() -> None:\n"
+            "    cases = [\n"
+            "        (\"prefill\", 1, 5),\n"
+            "        (\"decode\", 2, 5),\n"
+            "        (\"verify\", 3, 5),\n"
+        )
+        return unit, tail
+
     unit = (
         "Long-context benchmark fact: DSpark speculative decoding validates "
         "draft tokens against the target model while using target-layer hidden "
@@ -189,18 +251,33 @@ def build_prompt(tokenizer: Any, target_tokens: int,
     )
     if prompt_suffix:
         tail += f"\n\nProfile run marker: {prompt_suffix}"
+    return unit, tail
+
+
+def build_prompt(
+    tokenizer: Any,
+    target_tokens: int,
+    prompt_suffix: str = "",
+    *,
+    endpoint: str = "chat",
+    scenario: str = "context_confirm",
+) -> tuple[str, int]:
+    unit, tail = scenario_parts(scenario, prompt_suffix)
 
     low = 0
     high = max(1, target_tokens // 4)
-    while chat_token_count(tokenizer, unit * high + tail) < target_tokens:
+    while (
+        prompt_token_count(tokenizer, unit * high + tail, endpoint=endpoint)
+        < target_tokens
+    ):
         high *= 2
 
     best_text = tail
-    best_count = chat_token_count(tokenizer, best_text)
+    best_count = prompt_token_count(tokenizer, best_text, endpoint=endpoint)
     while low <= high:
         mid = (low + high) // 2
         text = unit * mid + tail
-        count = chat_token_count(tokenizer, text)
+        count = prompt_token_count(tokenizer, text, endpoint=endpoint)
         if count <= target_tokens:
             best_text = text
             best_count = count
@@ -211,12 +288,15 @@ def build_prompt(tokenizer: Any, target_tokens: int,
     return best_text, best_count
 
 
-def post_stream_chat(
+def post_stream_openai(
     base_url: str,
+    path: str,
     payload: dict[str, Any],
     timeout: float,
+    *,
+    endpoint: str,
 ) -> dict[str, Any]:
-    url = base_url.rstrip("/") + "/v1/chat/completions"
+    url = base_url.rstrip("/") + path
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -246,8 +326,16 @@ def post_stream_chat(
                 continue
             event = json.loads(data_text)
             choice = event.get("choices", [{}])[0]
-            delta = choice.get("delta") or {}
-            text = delta.get("content") or delta.get("reasoning_content") or ""
+            if endpoint == "completion":
+                text = choice.get("text") or ""
+            else:
+                delta = choice.get("delta") or {}
+                text = (
+                    delta.get("content")
+                    or delta.get("reasoning_content")
+                    or delta.get("reasoning")
+                    or ""
+                )
             if text:
                 if first_chunk_at is None:
                     first_chunk_at = now
@@ -265,28 +353,80 @@ def post_stream_chat(
     }
 
 
+def benchmark_payload(args: argparse.Namespace, prompt: str) -> tuple[str, dict[str, Any]]:
+    if args.endpoint == "completion":
+        path = "/v1/completions"
+        payload = {
+            "model": args.model,
+            "prompt": prompt,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "stream": True,
+        }
+    else:
+        path = "/v1/chat/completions"
+        payload = {
+            "model": args.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "stream": True,
+        }
+    if args.ignore_eos:
+        payload["ignore_eos"] = True
+    if args.endpoint == "chat" and args.thinking != "default":
+        payload["chat_template_kwargs"] = {"thinking": args.thinking == "true"}
+    if args.cache_salt:
+        payload["cache_salt"] = args.cache_salt
+    return path, payload
+
+
 def main() -> None:
     args = parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
-    prompt, prompt_tokens = build_prompt(tokenizer, args.prompt_tokens,
-                                         args.prompt_suffix)
+    visible_prompt_suffix = "" if args.stable_prompt else args.prompt_suffix
+    prompt, prompt_tokens = build_prompt(
+        tokenizer,
+        args.prompt_tokens,
+        visible_prompt_suffix,
+        endpoint=args.endpoint,
+        scenario=args.scenario,
+    )
 
     base_url = args.base_url.rstrip("/")
     health = http_get_text(base_url + "/health", timeout=10.0)
-    metrics_before = http_get_text(base_url + "/metrics", timeout=10.0)
+    path, payload = benchmark_payload(args, prompt)
 
-    payload = {
-        "model": args.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "stream": True,
-    }
-    if args.ignore_eos:
-        payload["ignore_eos"] = True
-    if args.cache_salt:
-        payload["cache_salt"] = args.cache_salt
-    stream = post_stream_chat(base_url, payload, timeout=args.timeout)
+    warmup_summaries: list[dict[str, Any]] = []
+    for warmup_idx in range(args.warmup_requests):
+        warmup_payload = dict(payload)
+        if args.cache_salt:
+            warmup_payload["cache_salt"] = f"{args.cache_salt}-warmup{warmup_idx + 1}"
+        warmup_stream = post_stream_openai(
+            base_url,
+            path,
+            warmup_payload,
+            timeout=args.timeout,
+            endpoint=args.endpoint,
+        )
+        warmup_output_tokens = len(
+            tokenizer.encode(warmup_stream["text"], add_special_tokens=False)
+        )
+        warmup_summaries.append({
+            "index": warmup_idx + 1,
+            "output_tokens_local": warmup_output_tokens,
+            "end_to_end_elapsed_s": warmup_stream["end"] - warmup_stream["start"],
+            "stream_chunks": warmup_stream["chunk_count"],
+        })
+
+    metrics_before = http_get_text(base_url + "/metrics", timeout=10.0)
+    stream = post_stream_openai(
+        base_url,
+        path,
+        payload,
+        timeout=args.timeout,
+        endpoint=args.endpoint,
+    )
     metrics_after = http_get_text(base_url + "/metrics", timeout=10.0)
     metrics_delta = metric_delta(metrics_before, metrics_after)
     quality_summary = dspark_quality_summary(metrics_delta)
@@ -318,8 +458,15 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "ignore_eos": args.ignore_eos,
+        "endpoint": args.endpoint,
+        "scenario": args.scenario,
+        "thinking": args.thinking,
         "prompt_suffix": args.prompt_suffix,
+        "stable_prompt": args.stable_prompt,
+        "visible_prompt_suffix": visible_prompt_suffix,
         "cache_salt": args.cache_salt,
+        "warmup_requests": args.warmup_requests,
+        "warmup_summaries": warmup_summaries,
         "output_tokens_local": output_tokens,
         "stream_chunks": stream["chunk_count"],
         "time_to_first_content_s": ttft,
