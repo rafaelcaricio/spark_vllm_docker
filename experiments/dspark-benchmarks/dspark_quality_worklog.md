@@ -1922,3 +1922,60 @@ Selector override experiment outcome, 2026-06-28:
      likely parity-zero `5-7%` win.
   4. If tau is already tapped and NCCL is not enough, deliberately re-scope
      draft/verify overlap as the remaining significant parity-preserving lever.
+
+## Realistic Coding-Session Harness + Near-Ceiling Milestone (2026-06-28)
+
+Built a realistic coding-session inference harness
+(`scripts/dspark_coding_session_*`): a read-only agentic multi-turn loop that
+drives the served model to investigate this project, reproducing the real coding
+session the synthetic short-prompt benchmark misses. It streams per-turn
+metrics to stderr and supports early-stop (`--stop-file`,
+`--early-stop-acceptance-floor`, `--early-stop-max-context`). Per-turn and
+per-session decode-speed and spec-decode acceptance/tau come from `/metrics`
+diffing (reusing the single-stream benchmark helpers); the summarizer emits a
+context-length-binned acceptance curve.
+
+3-session validation (10 turns each, context growing to ~80k tokens):
+
+- mean acceptance `0.627`, mean accepted/draft `3.14`, mean tau `4.14`,
+  mean decode `58.2 tok/s`, CV `5-7%` on acceptance/decode (A/B-ready).
+- The tau decay reproduces: per-turn tau falls `4.36 -> ~2.8` as context grows
+  `0.1k -> 80k` tokens.
+
+Key analytical findings from the harness data:
+
+- **The decode cycle is context-independent.** cycle = tau / decode_tps is flat
+  `~70 ms` from `0.1k` to `80k` context. The observed decode_tps drop is
+  entirely tau-driven (decode_tps / tau is constant `~14.3`); the per-token
+  forward does not slow with context. Sparse-MLA is already windowed, so there
+  is no large-context forward lever and a forward profile at 80k would just
+  re-show the small-context MoE-43% split.
+- **tau decay is a suffix effect, not a backbone collapse.** Per-position
+  conditional acceptance vs context bucket:
+
+  | context | pos0 | pos1 | pos2 | pos3 | pos4 |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | 0-2k | 0.878 | 0.842 | 0.841 | 0.831 | 0.807 |
+  | 8-20k | 0.892 | 0.858 | 0.863 | 0.824 | 0.846 |
+  | 20-40k | 0.893 | 0.874 | 0.861 | 0.820 | 0.834 |
+  | 40-80k | 0.861 | 0.834 | 0.822 | 0.799 | 0.768 |
+
+  pos0 (draft backbone first-token) is stable `~0.86-0.89` at every context (no
+  out-of-distribution collapse); only the suffix softens mildly at `40-80k`
+  (pos4 `0.834 -> 0.768`). pos0 is at its greedy T=0 ceiling (~target-argmax
+  match rate); raising it needs a better draft, not an integration fix.
+
+Conclusion: DSpark single-stream is near its ceiling at `~60 tok/s`
+(`~1.5x MTP-1`, `2.3x no-spec`). The forward is flat and MoE-tapped; tau is
+healthy with only mild long-context suffix decay. Remaining single-stream
+levers are modest: NCCL all-reduce overlap (`~5-7%`, parity-zero, only if
+currently serialized) and possibly a small suffix-tau reference-parity bump if
+the DeepSpec reference holds a higher suffix at long context. The `>25%` goal is
+not reachable single-stream with the forward flat and tau healthy; it lives in
+re-scoping to draft/verify overlap or concurrency.
+
+Next-step options recorded for the next pass: (1) NSYS timeline to confirm
+whether NCCL all-reduces are serialized (decides the one certain parity-zero
+win); (2) DeepSpec reference acceptance at `~40-80k` context to check suffix-tau
+headroom; (3) deliberate re-scope of draft/verify overlap for the `>25%` goal.
+
