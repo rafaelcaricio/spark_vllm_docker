@@ -1979,3 +1979,86 @@ whether NCCL all-reduces are serialized (decides the one certain parity-zero
 win); (2) DeepSpec reference acceptance at `~40-80k` context to check suffix-tau
 headroom; (3) deliberate re-scope of draft/verify overlap for the `>25%` goal.
 
+## Mixed Prefill+Decode Stability Fix, 2026-06-29
+
+Problem:
+
+- Concurrent DSpark serving crashed at c=4 when the scheduler mixed a new
+  request prefill with an existing request's speculative verify/decode step.
+- The failing batch had flattened target rows `421 = 415 + 6` for
+  `batch_size=2`, so `DSparkProposer._view_by_request()` raised:
+  `DSpark currently requires uniform flattened per-request inputs`.
+- This was not a model-quality issue; it was a proposer batching assumption.
+
+Implementation:
+
+- Added a ragged target-context preparation path in
+  `vllm/v1/spec_decode/dspark_proposer.py`.
+- The proposer now uses `query_start_loc` to split target hidden states and
+  positions by request, then groups requests with equal target-context lengths.
+- Each group is passed to `prefill_main()` as a full-batch tensor so DSpark's
+  internal main-KV cache row identity is preserved. Requests not in that group
+  get placeholder rows with `num_rejected_tokens == group_len`.
+- Updated `DeepSeekV4DSparkAttention.store_main_kv()` so a row can have zero
+  valid tokens (`valid_lengths.clamp(min=0)`), allowing placeholder rows to be
+  true no-ops.
+- Kept the old uniform path intact for single-stream and naturally rectangular
+  batches.
+
+Validation:
+
+- Local syntax: `py_compile` passed with `PYTHONPYCACHEPREFIX=/tmp/...`.
+- Lint: `ruff check` passed with `RUFF_CACHE_DIR=/tmp/...`.
+- Clean runtime image rebuilt on head and worker:
+  `vllm-dspark-runtime:clean`.
+- Installed overlay file hashes matched across nodes for
+  `dspark_proposer.py` and `dspark.py`.
+- Focused runtime-image tests:
+  `5 passed, 54 deselected`.
+- Runtime-image `test_dspark.py -k "not triton"`:
+  `55 passed, 4 deselected`.
+- Full `test_dspark.py` in the clean runtime image reached `55 passed`; the
+  remaining 4 CUDA Triton kernel tests failed because the thin runtime image has
+  no C compiler for Triton's driver helper build. This is an image capability
+  gap, not a DSpark proposer regression.
+
+Server validation:
+
+- Restarted TP=2 DSpark stack on `vllm-dspark-runtime:clean`.
+- Raised `.env.dspark-experiment` to `MAX_NUM_SEQS=8` so c=4/c=8 tests are not
+  hidden behind the old `MAX_NUM_SEQS=2` workaround.
+- Startup completed with `max_num_seqs=8`, `max_model_len=262144`,
+  `method=dspark`, and CUDA graph capture through `largest=96`.
+- Post-benchmark log scan found no `ValueError`, no uniform-reshape exception,
+  no traceback, and no NCCL watchdog fallout. `/health` remained `200`.
+
+Benchmark results:
+
+Result sets:
+
+- c=4 smoke:
+  `concurrent_interactive_262k_window_c4_mixedfix_mseq8_c4_20260629_013005_run1.json`
+- c=8 smoke:
+  `concurrent_interactive_262k_window_c8_mixedfix_mseq8_c8_20260629_013034_run1.json`
+- c=4 repeat:
+  `concurrent_interactive_262k_window_c4_mixedfix_mseq8_c4_3x_20260629_013113_run*.json`
+- c=8 repeat:
+  `concurrent_interactive_262k_window_c8_mixedfix_mseq8_c8_3x_20260629_013223_run*.json`
+
+Three-run repeat summary:
+
+| concurrency | per-user server decode tok/s | aggregate decode tok/s | acceptance | accepted/draft | first-token | suffix conditional | mean TTFC |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | `31.78 ± 1.86` | `127.10 ± 7.45` | `61.81% ± 2.20%` | `3.09 ± 0.11` | `90.34% ± 2.12%` | `79.17% ± 1.96%` | `1.00s ± 0.01s` |
+| 8 | `24.27 ± 2.06` | `194.16 ± 16.46` | `62.39% ± 0.51%` | `3.12 ± 0.03` | `90.99% ± 0.55%` | `78.36% ± 0.59%` | `1.70s ± 0.04s` |
+
+Shortcut / follow-up notes:
+
+- The mixed-batch path is stable but not yet optimal. It groups ragged chunks in
+  Python and reads small query/rejection metadata on CPU even when
+  `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`.
+- Placeholder rows preserve DSpark cache row identity, but they still run dummy
+  projection work inside `prefill_main()`. A future DSpark-specific ragged
+  main-KV update API or kernel should remove that overhead.
+- The next performance work should keep this stability gate in place and avoid
+  returning to `MAX_NUM_SEQS=2` as a workaround.
