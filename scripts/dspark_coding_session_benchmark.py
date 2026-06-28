@@ -37,7 +37,7 @@ from dspark_single_stream_benchmark import (
     metric_delta,
     server_max_model_len,
 )
-from dspark_coding_session_corpus import CORPUS, SYSTEM_PROMPT
+from dspark_coding_session_corpus import CORPORA, SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +658,8 @@ def run_session(
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     turns: list[dict[str, Any]] = []
     session_start = time.perf_counter()
-    corpus = CORPUS[: args.max_turns]
+    corpus_full = CORPORA[args.corpus]
+    corpus = corpus_full if args.max_turns <= 0 else corpus_full[: args.max_turns]
     session_stop_reason = "completed"
 
     for idx, prompt in enumerate(corpus):
@@ -773,7 +774,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Readable repo root (repeatable). Defaults to docker repo + vLLM fork.",
     )
-    p.add_argument("--max-turns", type=int, default=len(CORPUS))
+    p.add_argument(
+        "--corpus",
+        choices=("main", "detail"),
+        default="main",
+        help="Prompt corpus: 'main' (terse) or 'detail' (exhaustive explanations that force long reasoning output; reproduces real-session ~tau3).",
+    )
+    p.add_argument("--max-turns", type=int, default=0, help="Max turns (0 = whole selected corpus).")
     p.add_argument(
         "--stop-file",
         default="",

@@ -12,7 +12,8 @@ model="${MODEL:-deepseek-v4-flash-dspark}"
 base_url="${BASE_URL:-http://127.0.0.1:8000}"
 out_dir="${OUT_DIR:-experiments/dspark-benchmarks}"
 warmup_requests="${WARMUP_REQUESTS:-1}"
-max_tokens="${MAX_TOKENS:-1024}"
+max_tokens="${MAX_TOKENS:-2048}"
+corpus="${CORPUS:-detail}"
 timestamp="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "${out_dir}"
@@ -31,6 +32,7 @@ for i in $(seq 1 "${runs}"); do
       --base-url "${base_url}" \
       --model "${model}" \
       --model-dir "${model_dir}" \
+      --corpus "${corpus}" \
       --max-tokens "${max_tokens}" \
       --temperature 0.0 \
       --thinking false \
