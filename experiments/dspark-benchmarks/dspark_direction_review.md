@@ -195,15 +195,39 @@ ceiling (needs τ≈5.5 *and* `Tverify` ≤ ~55 ms) — a stretch, not the plan.
 
 ---
 
+## Step 1 diagnostic (2026-06-28): decode cycle is context-independent; τ is the sole lever
+
+A decode-speed-vs-context sweep (single-stream, prompt 0.5k→65k, decode 64 tok)
+showed **per-cycle decode tok/s is flat ~55 regardless of context** (only TTFT
+grows with prefill). Cross-checked against the harness turns, the spec-decode
+cycle time is **constant ~70 ms** across all context sizes, so the harness's
+observed decode-tok/s drop (62.9→40.6) is **entirely τ decay** (acceptance
+0.67→0.37), not a per-cycle / `Tverify` regression.
+
+- **Refutes** the sparse-MLA-at-large-KV / autotune-coverage hypothesis: the
+  target verify forward does NOT slow with KV length. The Lever-1
+  graph/autotune/`Tverify` direction is **dropped** — no kernel work to do there.
+- **τ (draft acceptance) is the sole real-session lever.** The decay is
+  workload-dependent: synthetic `code_completion` holds acceptance ~0.62 even at
+  65k, but realistic multi-turn coding Q&A (the harness) decays to ~0.37 — so the
+  harness is the correct gate, not the synthetic benchmark.
+- **Next step: reference-acceptance diagnostic at the realistic workload** — run
+  the DeepSeek-V4-Flash-DSpark reference on the harness workload and compare τ.
+  Reference τ ≫ integration τ ⇒ a fixable large-context parity gap (the real τ
+  lever). Reference τ ≈ integration τ ⇒ τ is at the released draft model's
+  ceiling on hard coding outputs ⇒ inherent, needs a better draft model.
+
 ## Bottom line
 
-**The warmed MTP-1 anchor is in and it vindicates the work: DSpark is 1.59× MTP-1
-and 2.41× no-spec single-stream — paper-grade.** The next budget goes to closing
-the gap toward the ~2.0–2.3× ceiling (~80–90 tok/s) via **parity-preserving
-`Tverify` reduction (Lever 1) + τ via reference parity (Lever 2)**, with `Tdraft`
-(Lever 3) as a follow-on. Set scheduler/§5.2-async work aside (concurrency-only),
-stop the proposer/kernel A/B loop (dry), and treat absolute `>100 tok/s` as a
-stretch beyond the ceiling — not the definition of done.
+**The decode cycle is context-independent (~70 ms, ~55 tok/s flat across 0.5k–65k
+context); the entire real-session slowdown is τ (draft acceptance) decay under
+realistic coding context.** `Tverify`/kernel work is off the table (Step 1
+refuted it); MoE tile changes are acceptance-unsafe; KVQ was neutral at small
+context. The single remaining lever is **τ via draft acceptance at large /
+realistic context**, gated by the reference-acceptance diagnostic: if the
+reference holds higher τ there, hunt the parity gap; if not, τ is at the model
+ceiling. Measure everything with the realistic coding-session harness, not the
+synthetic short-prompt benchmark.
 
 ## Sources
 
