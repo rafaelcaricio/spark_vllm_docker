@@ -1,0 +1,21 @@
+# Compose override for the experimental DeepSeek V4 Flash DSpark path.
+#
+# This keeps the production unholy-fusion entrypoint untouched. The selected
+# DSpark wrapper is mounted as /entrypoint.sh by ENTRYPOINT_FILE, and this
+# override also mounts the production unholy entrypoint read-only so the wrapper
+# can reuse its GB10 startup and patch logic.
+
+services:
+  head:
+    container_name: vllm-dspark-head
+    labels:
+      - "vllm-spark.variant=dspark-experiment"
+    volumes:
+      - ./entrypoints/entrypoint.unholy.sh:/entrypoint.unholy.sh:ro
+
+  worker:
+    container_name: vllm-dspark-worker
+    labels:
+      - "vllm-spark.variant=dspark-experiment"
+    volumes:
+      - ./entrypoints/entrypoint.unholy.sh:/entrypoint.unholy.sh:ro

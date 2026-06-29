@@ -1,0 +1,41 @@
+# Compose override for DSpark Nsight Compute profiling.
+#
+# Use with:
+#   ENTRYPOINT_FILE=./entrypoints/entrypoint.dspark-ncu-launch.sh \
+#   docker compose --env-file .env.dspark-experiment \
+#     -f docker-compose.yml -f compose/docker-compose.dspark-ncu.yml \
+#     --profile head up
+#
+# The worker can use the same override; only ROLE=head is launched under NCU by
+# default. This keeps normal DSpark serving separate from profiler launches.
+
+services:
+  head:
+    environment:
+      - DSPARK_NCU_LAUNCH=${DSPARK_NCU_LAUNCH:-1}
+      - DSPARK_NCU_ROLE=${DSPARK_NCU_ROLE:-head}
+      - DSPARK_NCU_PORT=${DSPARK_NCU_PORT:-49152}
+      - DSPARK_NCU_TARGET_PROCESSES=${DSPARK_NCU_TARGET_PROCESSES:-all}
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - /usr/local/cuda-13.0/bin:/usr/local/cuda-13.0/bin:ro
+      - /opt/nvidia/nsight-compute:/opt/nvidia/nsight-compute:ro
+      - /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
+
+  worker:
+    environment:
+      - DSPARK_NCU_LAUNCH=${DSPARK_NCU_LAUNCH_WORKER:-0}
+      - DSPARK_NCU_ROLE=${DSPARK_NCU_ROLE:-head}
+      - DSPARK_NCU_PORT=${DSPARK_NCU_PORT:-49152}
+      - DSPARK_NCU_TARGET_PROCESSES=${DSPARK_NCU_TARGET_PROCESSES:-all}
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - /usr/local/cuda-13.0/bin:/usr/local/cuda-13.0/bin:ro
+      - /opt/nvidia/nsight-compute:/opt/nvidia/nsight-compute:ro
+      - /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro

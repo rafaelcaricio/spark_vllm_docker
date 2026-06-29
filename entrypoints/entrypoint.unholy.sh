@@ -41,6 +41,15 @@ mkdir -p "${DG_JIT_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}
 : "${GPU_MEMORY_UTILIZATION:=0.80}"
 : "${MTP_NUM_TOKENS:=1}"
 
+# The base compose exports optional VLLM_* knobs as empty strings when unset.
+# This unholy-fusion vLLM build parses some of those envs during VllmConfig
+# construction, so empty strings can trip type conversion. Treat empty as unset.
+for _vllm_env in $(compgen -e VLLM_); do
+  if [ -z "${!_vllm_env}" ]; then
+    unset "${_vllm_env}"
+  fi
+done
+
 # Enforce mp-only — Ray is not available in the aidendle94 conda environment.
 if [ "${DISTRIBUTED_BACKEND}" != "mp" ]; then
   echo "[unholy] ERROR: unholy-fusion integration is mp-only; set DISTRIBUTED_BACKEND=mp" >&2
@@ -124,6 +133,13 @@ print("[unholy-patch] patch2 (determine_available_memory) applied to " + target)
 PYPATCH2
 fi
 
+EXTRA_ARGS=()
+if [ -n "${VLLM_EXTRA_ARGS:-}" ]; then
+  # Experimental-only escape hatch for vLLM CLI flags. Keep values simple:
+  # whitespace-delimited flags are supported, shell quoting is intentionally not.
+  read -r -a EXTRA_ARGS <<< "${VLLM_EXTRA_ARGS}"
+fi
+
 # ── ROLE=worker dispatch ─────────────────────────────────────────────────────
 if [ "${ROLE}" = "worker" ]; then
   : "${NODE_RANK:=1}"
@@ -153,7 +169,8 @@ if [ "${ROLE}" = "worker" ]; then
     --node-rank "${NODE_RANK}" \
     --master-addr "${HEAD_ROCE_IP}" \
     --master-port "${MASTER_PORT:-25000}" \
-    --headless
+    --headless \
+    "${EXTRA_ARGS[@]}"
 fi
 
 # ── ROLE=head ─────────────────────────────────────────────────────────────────
@@ -183,4 +200,5 @@ exec vllm serve "${MODEL_CONTAINER_PATH}" \
   --nnodes 2 \
   --node-rank "${NODE_RANK}" \
   --master-addr "${HEAD_ROCE_IP}" \
-  --master-port "${MASTER_PORT:-25000}"
+  --master-port "${MASTER_PORT:-25000}" \
+  "${EXTRA_ARGS[@]}"
