@@ -2062,3 +2062,100 @@ Shortcut / follow-up notes:
   main-KV update API or kernel should remove that overhead.
 - The next performance work should keep this stability gate in place and avoid
   returning to `MAX_NUM_SEQS=2` as a workaround.
+
+## Compact Selected-Row Ragged Main-KV Update, 2026-06-29
+
+Why:
+
+- The mixed prefill+decode stability fix above still used full-batch
+  placeholder rows inside each ragged group. That preserved DSpark cache row
+  identity, but it wasted `project_main()` and main-KV store work on dummy rows.
+- The DSpark paper's deployment section says the production system must support
+  variable-length queries without padding under dynamic verification budgets.
+  This cleanup moves our experimental path closer to that regime by making
+  ragged groups compact and explicitly mapping them back to DSpark cache rows.
+
+How:
+
+- `DSparkProposer._prepare_target_context_batches()` now emits compact grouped
+  tensors plus `request_indices` for ragged groups instead of full-batch tensors
+  with placeholder rows.
+- `DeepSeekV4DSpark.prefill_main()` and
+  `DeepSeekV4DSparkAttention.store_main_kv()` now accept `request_indices`.
+  Selected rows are read with `index_select()` and written back with
+  `index_copy_()`.
+- The uniform rectangular path is unchanged. Single-stream and naturally
+  uniform batches still call `prefill_main()` without `request_indices`.
+- This is still a bridge, not the final paper-style execution layer:
+  Python grouping remains, small metadata still crosses to CPU, and
+  `index_select()`/`index_copy_()` are not a custom ragged kernel.
+
+Validation:
+
+- Local syntax:
+  `PYTHONPYCACHEPREFIX=/tmp/vllm-dspark-pycache .venv/bin/python -m py_compile`
+  passed for the touched DSpark files.
+- Lint:
+  `RUFF_CACHE_DIR=/tmp/vllm-dspark-ruff-cache .venv/bin/python -m ruff check`
+  passed for the touched DSpark files.
+- Clean runtime image rebuilt on head and worker:
+  `vllm-dspark-runtime:clean`.
+- Installed overlay hashes matched across nodes:
+  `dspark_proposer.py`
+  `2b09718df3e60ca80e8e541c7dfc260ea8ec169fd00a6a274c0e42f69630dcde`,
+  `dspark.py`
+  `f5b7a40d8c4442b4110dd3298414c17f1df7676d8ebb83a4ae15c78ff7ab85c4`.
+- Focused runtime-image tests after the advisor-requested additions:
+  `3 passed, 58 deselected` for mixed compact groups, selected rows, and
+  selected rows with rejected suffix masking.
+- Runtime-image `test_dspark.py -k "not triton"`:
+  `57 passed, 4 deselected`.
+- Restarted the TP=2 DSpark stack on the clean image. `/health` returned `200`
+  after startup. Head and worker log scans found no traceback, assertion,
+  `RuntimeError`, or `ValueError` during the benchmark window.
+
+Benchmark result sets:
+
+- c=4 repeat:
+  `concurrent_interactive_262k_window_c4_compact_ragged_mseq8_c4_3x_20260629_015516_run*.json`
+- c=8 repeat:
+  `concurrent_interactive_262k_window_c8_compact_ragged_mseq8_c8_3x_20260629_015634_run*.json`
+
+Three-run repeat summary:
+
+| concurrency | per-user server decode tok/s | aggregate decode tok/s | acceptance | accepted/draft | first-token | suffix conditional | mean TTFC |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | `31.11 ± 2.19` | `124.43 ± 8.78` | `60.85% ± 2.04%` | `3.04 ± 0.10` | `89.15%` | `77.50%` | `0.93s ± 0.29s` |
+| 8 | `21.81 ± 3.32` | `174.48 ± 26.54` | `61.27% ± 1.94%` | `3.06 ± 0.10` | `89.48%` | `78.64%` | `0.94s ± 0.88s` |
+
+Interpretation:
+
+- Correctness/stability improved: the compact selected-row path handled c=4 and
+  c=8 mixed workloads without the old uniform-reshape crash.
+- Draft quality stayed in family with the placeholder-row checkpoint:
+  acceptance remained near `61%`, accepted/draft near `3.0`, and first-token
+  acceptance near `89%`.
+- Throughput did not improve. Versus the placeholder-row checkpoint, c=4 is
+  roughly flat/slightly lower (`127.10 -> 124.43` aggregate tok/s), and c=8 is
+  lower with higher variance (`194.16 -> 174.48` aggregate tok/s).
+- The likely reason is that removing dummy projection rows is smaller than the
+  remaining overheads at this concurrency: multiple Python `prefill_main()`
+  calls, selected-row `index_select()`/`index_copy_()`, route packing, and
+  fixed-budget verification still dominate.
+
+Next step:
+
+- Do not count this as a decode-speed win. Count it as a required
+  variable-length correctness cleanup that enables the paper-aligned scheduler
+  work.
+- Keep `MAX_NUM_SEQS=8` for future concurrent tests; do not hide ragged
+  behavior behind `MAX_NUM_SEQS=2`.
+- Follow Claude advisor's cleanup notes after benchmarking: rename the
+  misleading `VLLM_DSPARK_MULTI_SEQ_PAD` flag or add a comment explaining that
+  it now enables ragged grouping, and add a clear guard if
+  `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` is combined with ragged mixed
+  batches.
+- The next performance milestone should implement the paper's
+  hardware-aware/dynamic prefix scheduler on top of this ragged support, with a
+  profiled local SPS curve, then compare c=4/c=8 per-user and aggregate tok/s
+  against this compact-ragged checkpoint.
