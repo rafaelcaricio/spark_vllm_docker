@@ -1,0 +1,69 @@
+{
+  "bins": 10,
+  "env": "VLLM_DSPARK_STS_TEMPERATURES=1.45009,2.33681,3.94545,5.54611,20",
+  "payloads": 16,
+  "positions": [
+    {
+      "calibrated_brier": 0.03976727220562444,
+      "calibrated_ece": 0.005652479091851471,
+      "calibrated_nll": 0.16493866018293737,
+      "position": 0,
+      "raw_brier": 0.04126380702183375,
+      "raw_ece": 0.03103703619909488,
+      "raw_nll": 0.18930594795086006,
+      "samples": 221,
+      "temperature": 1.4500876678227257
+    },
+    {
+      "calibrated_brier": 0.11821234711901982,
+      "calibrated_ece": 0.023324859554574733,
+      "calibrated_nll": 0.39565109384356245,
+      "position": 1,
+      "raw_brier": 0.13494103241914573,
+      "raw_ece": 0.1298826063348415,
+      "raw_nll": 0.589939971707302,
+      "samples": 221,
+      "temperature": 2.336805027435949
+    },
+    {
+      "calibrated_brier": 0.1928728971640621,
+      "calibrated_ece": 0.05247476561716872,
+      "calibrated_nll": 0.5722050151820003,
+      "position": 2,
+      "raw_brier": 0.2579961808156051,
+      "raw_ece": 0.2569579864253391,
+      "raw_nll": 1.0644192752689248,
+      "samples": 221,
+      "temperature": 3.9454528288098207
+    },
+    {
+      "calibrated_brier": 0.22387118589950625,
+      "calibrated_ece": 0.06407590768956045,
+      "calibrated_nll": 0.6393888727330729,
+      "position": 3,
+      "raw_brier": 0.3271416249130515,
+      "raw_ece": 0.3307492036199093,
+      "raw_nll": 1.261440686560608,
+      "samples": 221,
+      "temperature": 5.5461117142336
+    },
+    {
+      "calibrated_brier": 0.24866684461330474,
+      "calibrated_ece": 0.09168451771868452,
+      "calibrated_nll": 0.6904652936314608,
+      "position": 4,
+      "raw_brier": 0.44283854313825366,
+      "raw_ece": 0.459403402714932,
+      "raw_nll": 1.6603907291222446,
+      "samples": 221,
+      "temperature": 20.0
+    }
+  ],
+  "temperatures": [
+    1.4500876678227257,
+    2.336805027435949,
+    3.9454528288098207,
+    5.5461117142336,
+    20.0
+  ]
+}

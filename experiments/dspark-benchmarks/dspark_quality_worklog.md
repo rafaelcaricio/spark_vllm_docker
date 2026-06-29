@@ -2279,3 +2279,74 @@ Next step:
 
 - Profile c16 forced verification lengths to build a B=32/48/64/80/96 SPS
   curve, then retest hardware scheduling against that c16-grounded curve.
+
+## Single-Stream STS Calibration and SPS-Dominance Bypass, 2026-06-29
+
+Purpose:
+
+- Re-check the paper's STS confidence-calibration idea with longer 1024-token
+  single-stream evidence and avoid paying CPU scheduling overhead when the
+  profiled local SPS curve says the full DSpark prefix is already the best
+  hardware point.
+
+Calibration pass:
+
+- Diagnostic run:
+  `single_stream_interactive_262k_window_sts_calibration_1024_20260629_094736_run1.json`.
+- Server decode speed: `63.67` tok/s, acceptance `72.52%`,
+  accepted/draft `3.63`.
+- Fitted per-position temperatures from bounded log bins:
+  `VLLM_DSPARK_STS_TEMPERATURES=1.45009,2.33681,3.94545,5.54611,20`.
+
+Three-run 1024-token comparison:
+
+| config | server tok/s | acceptance | accepted/draft | cycle ms | mean scheduled length | prune rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| scheduler off baseline | `62.08 ± 0.70` | `69.04%` | `3.452` | `71.71` | `5.00` | `0.0000` |
+| STS + hardware scheduler | `62.42 ± 1.92` | `72.26%` | `3.613` | `73.90` | `5.00` | `0.0000` |
+| hardware scheduler with SPS-dominance bypass | `61.75 ± 1.37` | `69.81%` | `3.490` | `72.69` | `5.00` | `0.0000` |
+
+Implementation:
+
+- Added `full_prefix_dominates_sps_curve()` to classify hardware regimes where
+  no confidence observation can make a shorter prefix win because the profiled
+  SPS rate at the full prefix is at least as high as every shorter width.
+- `DSparkProposer` now tracks the active unpadded request count separately from
+  the CUDA graph padded batch size.
+- In the dominated regime, `VLLM_DSPARK_CONFIDENCE_SCHEDULER=hardware` skips the
+  confidence head, STS calibration, CPU `.tolist()`, Python scheduler, and
+  diagnostics observation, then verifies the full prefix. A one-time log records
+  the bypass.
+
+Validation:
+
+- Fresh clean image rebuild on both nodes.
+- Both ranks logged:
+  `DSpark hardware scheduler bypassing confidence head: full prefix dominates the profiled SPS curve for request_count=1`.
+- No `JIT compilation during inference`, traceback, OOM, or CUDA-out errors
+  appeared in the benchmark log grep.
+- Host `py_compile` passed for the edited vLLM files. Host pytest remains
+  blocked by the unbuilt local `vllm._C` extension, so runtime validation used
+  the rebuilt container image.
+
+Interpretation:
+
+- STS changes confidence used for scheduling, not the draft tokens, so the
+  apparent acceptance lift is likely run noise unless it reproduces with many
+  more repeats.
+- The single-stream SPS curve is dominated by the full width at B=6, so the
+  paper-aligned scheduler degenerates to full-prefix verification. That is why
+  both STS/hardware and the bypass run show zero pruning.
+- This is not a decode-speed milestone. It removes wasted CPU work in an
+  impossible scheduling regime and confirms the next speed work should move hot
+  decisions/data movement to GPU only where the scheduler can actually prune
+  or where draft execution itself can be fused.
+
+Next GPU-offload direction:
+
+- Move prefix selection and draft-length packing to a GPU-side reduction for
+  loaded c8/c16 regimes where pruning can happen.
+- Keep the CPU calibration/logging path bounded and opt-in only.
+- For single-stream, the larger remaining lever is draft-side fusion
+  (`Markov` loop + argmax/confidence + full draft graph capture), not
+  confidence scheduling.
