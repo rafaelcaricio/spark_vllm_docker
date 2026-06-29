@@ -1,0 +1,56 @@
+# Compose override for DSpark Nsight Systems timeline profiling.
+#
+# This is intentionally separate from the normal DSpark experiment stack. The
+# entrypoint wrapper launches the selected roles under `nsys profile` and uses
+# vLLM's `profiler="cuda"` `/start_profile` and `/stop_profile` endpoints as the
+# capture range. Startup, model load, warmup, and graph capture stay outside the
+# captured range.
+
+services:
+  head:
+    environment:
+      - DSPARK_NSYS_LAUNCH=${DSPARK_NSYS_LAUNCH:-1}
+      - DSPARK_NSYS_ROLE=${DSPARK_NSYS_ROLE:-all}
+      - DSPARK_NSYS_OUT_DIR=${DSPARK_NSYS_OUT_DIR:-/cache/huggingface/dspark-profiles/nsys}
+      - DSPARK_NSYS_LABEL=${DSPARK_NSYS_LABEL:-dspark_nsys}
+      - DSPARK_NSYS_TRACE=${DSPARK_NSYS_TRACE:-cuda,nvtx,osrt,cublas,cudnn}
+      - DSPARK_NSYS_SAMPLE=${DSPARK_NSYS_SAMPLE:-none}
+      - DSPARK_NSYS_BACKTRACE=${DSPARK_NSYS_BACKTRACE:-none}
+      - DSPARK_NSYS_CAPTURE_RANGE=${DSPARK_NSYS_CAPTURE_RANGE:-cudaProfilerApi}
+      - DSPARK_NSYS_CAPTURE_RANGE_END=${DSPARK_NSYS_CAPTURE_RANGE_END:-stop}
+      - DSPARK_NSYS_CUDA_GRAPH_TRACE=${DSPARK_NSYS_CUDA_GRAPH_TRACE:-graph}
+      - DSPARK_NSYS_TRACE_FORK_BEFORE_EXEC=${DSPARK_NSYS_TRACE_FORK_BEFORE_EXEC:-true}
+      - DSPARK_NSYS_STATS=${DSPARK_NSYS_STATS:-true}
+      - DSPARK_NSYS_EXPORT=${DSPARK_NSYS_EXPORT:-sqlite}
+      - DSPARK_NSYS_PYTORCH=${DSPARK_NSYS_PYTORCH:-none}
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - /usr/local/cuda-13.0/bin:/usr/local/cuda-13.0/bin:ro
+      - /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
+
+  worker:
+    environment:
+      - DSPARK_NSYS_LAUNCH=${DSPARK_NSYS_LAUNCH_WORKER:-1}
+      - DSPARK_NSYS_ROLE=${DSPARK_NSYS_ROLE:-all}
+      - DSPARK_NSYS_OUT_DIR=${DSPARK_NSYS_OUT_DIR:-/cache/huggingface/dspark-profiles/nsys}
+      - DSPARK_NSYS_LABEL=${DSPARK_NSYS_LABEL:-dspark_nsys}
+      - DSPARK_NSYS_TRACE=${DSPARK_NSYS_TRACE:-cuda,nvtx,osrt,cublas,cudnn}
+      - DSPARK_NSYS_SAMPLE=${DSPARK_NSYS_SAMPLE:-none}
+      - DSPARK_NSYS_BACKTRACE=${DSPARK_NSYS_BACKTRACE:-none}
+      - DSPARK_NSYS_CAPTURE_RANGE=${DSPARK_NSYS_CAPTURE_RANGE:-cudaProfilerApi}
+      - DSPARK_NSYS_CAPTURE_RANGE_END=${DSPARK_NSYS_CAPTURE_RANGE_END:-stop}
+      - DSPARK_NSYS_CUDA_GRAPH_TRACE=${DSPARK_NSYS_CUDA_GRAPH_TRACE:-graph}
+      - DSPARK_NSYS_TRACE_FORK_BEFORE_EXEC=${DSPARK_NSYS_TRACE_FORK_BEFORE_EXEC:-true}
+      - DSPARK_NSYS_STATS=${DSPARK_NSYS_STATS:-true}
+      - DSPARK_NSYS_EXPORT=${DSPARK_NSYS_EXPORT:-sqlite}
+      - DSPARK_NSYS_PYTORCH=${DSPARK_NSYS_PYTORCH:-none}
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - /usr/local/cuda-13.0/bin:/usr/local/cuda-13.0/bin:ro
+      - /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro

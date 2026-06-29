@@ -21,6 +21,7 @@ VLLM_USE_B12X_WO_PROJECTION=1                 # verifier output-projection opt (
 VLLM_DSPARK_CONFIDENCE_SCHEDULER=off          # scheduler is concurrency-only; inert single-stream
 VLLM_DSPARK_LOCAL_ARGMAX=1                    # vocab-parallel local argmax draft path
 VLLM_DSPARK_REPLICATE_MARKOV_W1=1             # replicated Markov W1
+VLLM_DSPARK_DRAFT_STREAM=1                    # experiment lane: draft-stream/deferred-fence scaffold
 VLLM_DSPARK_FUSED_MARKOV_ARGMAX=0             # fused Markov lost to vendor projection
 VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT=0      # KVQ neutral on quality (tested)
 VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM=0         # MoE selector override OFF (blocks_per_sm-only shmem-hangs; tile changes collapse acceptance)
@@ -96,7 +97,9 @@ to draft (suffix collapse); see the `detail` corpus harness (`scripts/dspark_cod
 
 ## Next lever (out of current scope, evidence-supported)
 
-Single-stream in-scope work is exhausted. The only remaining lever that still improves single-stream
-coding decode is **draft/verify overlap** (hide Tdraft ~8.6 ms behind Tverify; lossless; stays
-uniform/FULL-safe at γ=5): expected cycle 70.9→~61 ms → ~+12% tok/s, gated on the `detail` harness
-with acceptance/τ preserved.
+Single-stream in-scope work is exhausted except for pipeline restructuring. The current
+`VLLM_DSPARK_DRAFT_STREAM=1` implementation is **not** full draft/verify overlap; it launches
+after rejection and mainly hides draft work behind bookkeeping/scheduler prep. The remaining lever is
+real draft/verify overlap via an earlier dependency-safe launch point or optimistic double-buffered
+draft state (hide Tdraft ~8.6 ms behind Tverify; lossless if acceptance/τ are preserved): expected
+cycle 70.9→~61 ms → ~+12% tok/s, gated on the `detail` harness plus Nsight proof of actual overlap.

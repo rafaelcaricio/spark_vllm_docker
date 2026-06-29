@@ -14,7 +14,10 @@ pieces before we attach them to the experimental vLLM source tree:
 - the hardware-aware greedy prefix scheduler matches exhaustive search when it
   searches the full greedy path over profiled batch capacities,
 - early-stop scheduling can get trapped by jagged hardware capacity cliffs, which
-  matches the production caveat in the DSpark paper.
+  matches the production caveat in the DSpark paper,
+- measured draft/verify overlap budgets stay honest about target-layer
+  dependencies, separating legal tail overlap from the theoretical full-draft
+  hiding ceiling.
 
 Run the grounded pytest suite:
 

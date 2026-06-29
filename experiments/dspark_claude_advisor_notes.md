@@ -306,7 +306,6 @@ the GPU saturates and pruning becomes valuable.
    VLLM_DSPARK_CONFIDENCE_SCHEDULER=hardware
    VLLM_DSPARK_SPS_CURVE=8:7.235357,12:7.749286,16:6.334372,20:6.767292,24:7.280485,48:5.396963
    VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP=0
-   VLLM_DSPARK_MULTI_SEQ_PAD=1
    MAX_NUM_SEQS=4
    ```
    Run concurrent sweep c=1/2/4/8 (2 repeats each). Compare per-user tok/s,

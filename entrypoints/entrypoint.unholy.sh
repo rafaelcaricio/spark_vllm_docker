@@ -40,6 +40,7 @@ mkdir -p "${DG_JIT_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}
 : "${MAX_NUM_BATCHED_TOKENS:=8192}"
 : "${GPU_MEMORY_UTILIZATION:=0.80}"
 : "${MTP_NUM_TOKENS:=1}"
+: "${KV_CACHE_DTYPE:=fp8}"
 
 # The base compose exports optional VLLM_* knobs as empty strings when unset.
 # This unholy-fusion vLLM build parses some of those envs during VllmConfig
@@ -149,7 +150,7 @@ if [ "${ROLE}" = "worker" ]; then
     --host 0.0.0.0 --port "${HOST_PORT:-8000}" \
     --trust-remote-code \
     --tensor-parallel-size "${TP_SIZE:-2}" \
-    --kv-cache-dtype fp8 \
+    --kv-cache-dtype "${KV_CACHE_DTYPE}" \
     --block-size 256 \
     --max-model-len "${MAX_MODEL_LEN}" \
     --max-num-seqs "${MAX_NUM_SEQS}" \
@@ -181,7 +182,7 @@ exec vllm serve "${MODEL_CONTAINER_PATH}" \
   --host 0.0.0.0 --port "${HOST_PORT:-8000}" \
   --trust-remote-code \
   --tensor-parallel-size "${TP_SIZE:-2}" \
-  --kv-cache-dtype fp8 \
+  --kv-cache-dtype "${KV_CACHE_DTYPE}" \
   --block-size 256 \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \

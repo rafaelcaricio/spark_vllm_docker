@@ -71,6 +71,14 @@ optimized or better graph-captured.
   prompt buckets, padded speculative prep, and rejection sampling:
   `78.86` server decode tok/s mean, `1.06%` CV, `56.42%` draft acceptance,
   `2.82` accepted tokens per draft.
+- Community pull-back repeat on 2026-06-29, after verifying stable request-slot
+  write and draft-read wiring against the derived 1M/NVFP4 repo: static c8
+  `max_tokens=1024` smoke passed at `129.995` aggregate tok/s, staggered c8
+  passed at `126.810` aggregate tok/s, and the condense victim matched
+  byte-for-byte while `52` churn requests ran. The matched single-stream
+  1024-token run set measured `63.019` server tok/s mean, `1.54%` CV,
+  `73.31%` draft acceptance, and `3.666` accepted tokens per draft. This closes
+  the request-row corruption risk but is not a speed-gate win.
 - Fast draft-output path, threshold off, clean rebuilt runtime image:
   `72.68` server decode tok/s mean, `23.88%` CV, `52.49%` draft acceptance,
   `2.62` accepted tokens per draft. This reduced returned-logit/confidence
@@ -213,6 +221,204 @@ Invalid kernel experiment:
 - `_DSPARK_SCORE_K_BLOCK=16` was tested on the real model and rejected.
 - Three measured runs produced near-zero accepted drafts (`0`, `0`, `1`
   accepted tokens), so the score block was restored to `8`.
+
+## Community Pull-Back Benchmark
+
+Configuration:
+
+- Runtime lane: preserved 262k fp8 DSpark profile.
+- Served model: `deepseek-v4-flash-dspark`
+- `max_num_seqs=8`
+- Request-stability smoke cap: `max_tokens=1024`
+- Single-stream cap: `max_tokens=1024`, `prompt_tokens=512`,
+  `temperature=0.0`, `ignore_eos=true`.
+
+Artifacts:
+
+- `request_stability_pullback_20260629_143731.json`
+- `single_stream_interactive_262k_window_pullback_before_raggedwarmup_20260629_144112_run*.json`
+
+Request-stability results:
+
+| check | result | aggregate tok/s | acceptance | accepted / draft |
+| --- | --- | ---: | ---: | ---: |
+| static c8 | pass, no request errors | `129.995` | `36.74%` | `1.837` |
+| staggered c8 | pass, no request errors | `126.810` | `36.91%` | `1.846` |
+| condense/churn | pass, byte-for-byte victim match | n/a | `48.75%` | `2.437` |
+
+Single-stream repeat:
+
+| run | server tok/s | draft acceptance | accepted / draft | cycle ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | `63.51` | `74.04%` | `3.70` | `74.03` |
+| 2 | `61.90` | `71.34%` | `3.57` | `73.78` |
+| 3 | `63.64` | `74.56%` | `3.73` | `74.29` |
+
+Aggregate:
+
+- Server decode speed: `63.019` tok/s mean, `0.970` stdev, `1.54%` CV.
+- Draft acceptance: `73.31%` mean.
+
+## Draft Stream And Real Overlap Direction
+
+Paper-refresh takeaway from FA4-style pipeline work: treat decode as a
+dependency graph and overlap only work whose inputs are already available. For
+DSpark, the next draft cannot start as a full graph before rejection sampling:
+it needs the committed next token and the last accepted target hidden row. A
+full verifier/draft overlap therefore requires an optimistic, double-buffered
+branch that can be discarded when acceptance differs.
+
+First implemented draft-stream/bookkeeping step:
+
+- `VLLM_DSPARK_DRAFT_STREAM=1` enqueues DSpark proposal work on a dedicated CUDA
+  stream after rejection sampling.
+- The main/default path continues into CPU bookkeeping while the draft stream
+  runs, then fences with a CUDA event before KV-connector finalization and
+  before the next default-stream use.
+- DSpark context batching no longer synchronizes on GPU scalar metadata in the
+  normal path; it uses CPU query-start metadata for validation and keeps GPU
+  query-start/valid-length tensors for kernels.
+- Iteration diagnostics now split target hidden selection from target logits
+  projection, and report draft-stream enqueue/fence buckets. Timing diagnostics
+  still synchronize and are for profiling only, not throughput gates.
+
+Benchmark gate for this pass: rebuild the clean runtime image, run the existing
+single-stream 1024-token benchmark at least three times with
+`VLLM_DSPARK_DRAFT_STREAM=0` and `=1`, and verify acceptance/accepted-per-draft
+are unchanged while Nsight/NVTX shows real overlap.
+
+Draft-stream A/B on clean image:
+
+| mode | mean server tok/s | stdev | mean acceptance | accepted / draft |
+| --- | ---: | ---: | ---: | ---: |
+| `VLLM_DSPARK_DRAFT_STREAM=0` | `57.96` | `3.89` | `65.29%` | `3.264` |
+| `VLLM_DSPARK_DRAFT_STREAM=1` | `59.26` | `0.56` | `66.26%` | `3.313` |
+
+Result: `+2.25%` server decode tok/s by this A/B, with acceptance preserved but
+below the `+10%` overlap goal. We are still making
+`VLLM_DSPARK_DRAFT_STREAM=1` the default DSpark evolution lane because it keeps
+streams/events in the hot path for future pipeline work. The current safe
+implementation mainly overlaps draft GPU work with CPU/output bookkeeping; the
+next overlap step must move the launch point earlier in the dependency DAG or
+add optimistic double-buffered next-draft state.
+
+Second draft-stream/deferred-fence step:
+
+- Async DSpark now carries the draft stream event across the `sample_tokens()`
+  return instead of fencing immediately.
+- The next default-stream GPU consumer fences lazily before using
+  `valid_sampled_token_count_gpu`, `prev_sampled_token_ids`, or `_draft_token_ids`.
+- If the next scheduled batch does not consume the prior draft, `sample_tokens()`
+  fences before clearing/reusing draft state. Sync scheduling and KV connector
+  paths keep the immediate fence.
+- Expected benefit is still bounded: same-request verification cannot start
+  before the draft token IDs exist, but engine scheduling, output copy/setup, and
+  next-step CPU preparation can now overlap the draft graph.
+
+Clean-image 1024-token evidence for the deferred-fence path:
+
+| set | runs | mean server tok/s | stdev | mean acceptance | accepted / draft |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| smoke | 1 | `64.29` | n/a | `75.16%` | `3.758` |
+| repeat batch 1 | 3 | `63.27` | `0.77` | `72.68%` | `3.634` |
+| repeat batch 1+2 | 6 | `62.52` | `1.70` | `71.73%` | `3.587` |
+
+Interpretation: the deferred-fence path is a keeper because it is positive
+against the earlier draft-stream and stream-off baselines, but it is still
+bookkeeping/scheduler overlap, not verifier/draft overlap. It does not clear the
+large-overlap gate.
+
+Direct-copy input assembly experiment:
+
+- A follow-up single-request path copied the sampled token and contiguous draft
+  token slice directly after the pending-event fence, bypassing the existing
+  indexed scatter for the unchanged single-stream case.
+- Six 1024-token real-model runs averaged `61.13` server tok/s, `1.50` stdev,
+  `69.29%` acceptance, and `3.464` accepted tokens per draft.
+- This was `-2.22%` versus the lazy-fence six-run baseline (`62.52` tok/s), so
+  the direct-copy code was reverted. The event lifecycle helper and safety tests
+  remain.
+
+Clean-image restore after reverting direct-copy:
+
+- Rebuilt and synced `vllm-dspark-runtime:clean` image
+  `sha256:c7eadfd43485...` to both TP ranks.
+- `/health` returned 200 and `/v1/models` reported
+  `deepseek-v4-flash-dspark` with `max_model_len=262144`.
+- Restore smoke artifact:
+  `single_stream_interactive_262k_window_lazyfence_restore_smoke_20260629_165047_run1.json`.
+- Restore smoke metrics, `max_tokens=1024`, single stream:
+  `60.63` server tok/s, `68.92%` acceptance, `3.446` accepted tokens per
+  draft, `5.0` scheduled draft length.
+
+Safety tests added before trusting this as a default evolution lane:
+
+- pending DSpark draft event is waited before draft/proposer state is cleared
+  and reused;
+- explicit event fencing does not clear a newer pending event;
+- single-stream next-iteration input-id assembly fences before reading
+  `_draft_token_ids`;
+- churn/reordered next-iteration input-id assembly uses the previous request
+  rows for sampled and draft tokens after the pending-event fence;
+- existing request-stable slot, ragged, condense, and churn tests remain in the
+  DSpark suite.
+
+Clean-image request-stability smoke after the async lifecycle tests:
+
+- Artifact: `request_stability_draftstream_restore_20260629_165317.json`.
+- Static c8, `max_tokens=1024`: passed, `132.82` aggregate tok/s, `36.97%`
+  acceptance, `1.849` accepted tokens per draft, no request errors.
+- Staggered c8, `max_tokens=1024`: passed, `125.52` aggregate tok/s, `40.91%`
+  acceptance, `2.046` accepted tokens per draft, no request errors.
+- Condense/churn: victim matched the expected payload byte-for-byte,
+  `churn_errors=0`, `churn_requests=19`, `47.26%` acceptance, `2.363`
+  accepted tokens per draft.
+- Logs still showed first-use JIT for `_dspark_store_main_kv_ragged_kernel` and
+  `_compute_global_topk_indices_and_lens_kernel` during the smoke. Treat that as
+  a warmup coverage TODO, not a steady-state decode-speed lever.
+
+Open safety gate: `vllm/compilation/cuda_graph.py` uses the global CUDA graph
+pool and has a TODO warning that the global pool may not be safe for multiple
+streams. Because DSpark draft graph replay now runs on a dedicated stream,
+Nsight/stress validation must prove graph replay safety before this flag is
+called production-stable.
+
+Dependency-DAG review after the restore:
+
+- The DSpark checkpoint uses `dspark_target_layer_ids=[40, 41, 42]` on a
+  `43`-layer target. The draft input is therefore the concatenated hidden state
+  from the final three target layers, not an early-layer feature.
+- The current vLLM integration exposes those features only through
+  `get_dspark_target_hidden_states()` after target forward returns. There is a
+  `VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE` path that can avoid extra capture
+  work for earlier target taps, but it does not move layer-42 availability
+  meaningfully earlier than the end of the verifier graph.
+- Consequence: hiding the whole `~10.6ms` draft graph under the `~61ms` verifier
+  graph is not legal in the current graph shape. The earliest safe non-
+  optimistic launch point is after the final DSpark target hidden row exists,
+  leaving only target-logits/rejection/bookkeeping work to overlap.
+- An optimistic branch still cannot produce a useful next draft before the
+  assumed accepted hidden row exists. It can discard incorrect assumptions, but
+  the hidden-row dependency means it cannot hide most of the verifier graph
+  without a deeper target-graph split or a different DSpark feature tap.
+- The next real overlap experiment should therefore be narrower and explicit:
+  split or event-tag the target graph around the layer-42 DSpark feature write,
+  then measure how much logits/rejection/tail work remains to hide. If that
+  tail is only the observed `~2-4ms`, the remaining `>10%` speed target must
+  move to verifier kernels or draft graph/FULL fusion rather than speculative
+  stream scheduling.
+- Accepted tokens per draft: `3.666` mean.
+- Estimated cycle time: `74.033ms` mean.
+
+Interpretation:
+
+- The derived/community repo's remaining source-level value has been pulled
+  into the current branch where it matters: persistent request slots now cover
+  main-KV writes and draft reads, and the 1M `nvfp4_ds_mla` Stage C profile is
+  isolated.
+- This evidence does not move the single-stream speed gate. It supports moving
+  back to the measured bottleneck: target verification wall time and the
+  draft-stage graph/launch/NCCL gap, not more request-slot or warmup-route work.
 
 ## Reference KV Quant-Dequant Probe
 
@@ -2150,11 +2356,9 @@ Next step:
   work.
 - Keep `MAX_NUM_SEQS=8` for future concurrent tests; do not hide ragged
   behavior behind `MAX_NUM_SEQS=2`.
-- Follow Claude advisor's cleanup notes after benchmarking: rename the
-  misleading `VLLM_DSPARK_MULTI_SEQ_PAD` flag or add a comment explaining that
-  it now enables ragged grouping, and add a clear guard if
-  `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` is combined with ragged mixed
-  batches.
+- Follow-up cleanup removed the misleading ragged/pad compatibility switch
+  entirely. Add a clear guard if `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` is
+  combined with ragged mixed batches.
 - The next performance milestone should implement the paper's
   hardware-aware/dynamic prefix scheduler on top of this ragged support, with a
   profiled local SPS curve, then compare c=4/c=8 per-user and aggregate tok/s
@@ -2428,3 +2632,631 @@ Next step:
   image disables FlashInfer allreduce because the upstream default threshold
   table has no GB10 tuned entry; the vLLM patch under test lets an experiment
   opt into this backend without making it the default.
+
+## Request-Stable Slot Pullback and 1M Profile Validation, 2026-06-29
+
+Purpose:
+
+- Pull back the useful ideas from
+  `/home/pieter/Code/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark`
+  without replacing our newer DSpark/vLLM work.
+- Close the suspected request-stable DSpark main-KV gap for both writes and
+  draft reads after batch condensation.
+- Keep the 1M `nvfp4_ds_mla` work isolated from the default 262k fp8 speed
+  path.
+
+Implementation summary:
+
+- DSpark proposer now maps request IDs to stable main-KV slots and passes the
+  selected slot tensor through both main-KV writes and draft sparse-attention
+  reads.
+- Sparse-attention Triton kernels read main KV from `request_indices` directly,
+  avoiding a full-row `index_select` copy of 200k/1M KV rows.
+- `nvfp4_ds_mla` support was source-ported as Stage C padded DeepSeek V4
+  sparse-MLA envelope support, with separate 1M/200k env profiles.
+
+Validation:
+
+- Clean-image focused pytest:
+  `/tmp/test_dspark.py -k 'request_stable or selected_rows or condense or requests_only_needed or prefill_and_draft'`
+  passed `11 passed, 70 deselected`.
+- Static c8 smoke, `max_tokens=1024`: `135.45` aggregate tok/s, acceptance
+  `39.61%`, no errors.
+- Staggered c8 smoke, `max_tokens=1024`: `130.65` aggregate tok/s,
+  acceptance `37.24%`, no errors.
+- Grounded condense victim under churn matched the expected payload
+  byte-for-byte; churn completed `30` requests with no errors.
+
+Three-run 1024-token single-stream result:
+
+| config | server tok/s | acceptance | accepted/draft |
+| --- | ---: | ---: | ---: |
+| scheduler off baseline | `62.08 +/- 0.70` | `69.04%` | `3.452` |
+| fused Markov argmax checkpoint | `61.75 +/- 3.52` | `70.05%` | `3.503` |
+| request-stable slot pullback | `61.50 +/- 2.81` | `70.88%` | `3.544` |
+
+Benchmark files:
+
+- `single_stream_interactive_262k_window_requeststable_slots1024_20260629_115827_run*.json`
+
+Profile validation:
+
+| profile | served max len | KV pool | full-window concurrency |
+| --- | ---: | ---: | ---: |
+| `1M / max_num_seqs=1 / nvfp4_ds_mla` | `1048576` | `2,110,064` | `2.01x` |
+| `1M / max_num_seqs=6 / nvfp4_ds_mla` | `1048576` | `2,068,655` | `1.97x` |
+| `200k / max_num_seqs=16 / nvfp4_ds_mla` | `200000` | `788,856` | `3.94x` |
+
+Interpretation:
+
+- The request-stable slot work is a correctness fix, not a single-stream speed
+  win. It should prevent wrong-row draft reads after condensation/ragged batch
+  churn and gives us stronger concurrency safety before further kernel work.
+- The 1M NVFP4 lanes reproduce the derived repo's capacity class when run in
+  the isolated profiles. The 200k/mseq16 profile is an interactive concurrency
+  lane, not sixteen simultaneous full-200k requests.
+- The next speed work should remain on the known hot path: Markov/global top-1
+  communication, draft-output head strategy, sparse-attention/projection fusion,
+  and warmup/autotune coverage for DSpark-specific decode shapes.
+
+## Flat Ragged Main-KV Store Pullback, 2026-06-29
+
+Purpose:
+
+- Remove the remaining Python ragged grouping / selected-row bridge in mixed
+  prefill+decode DSpark main-KV updates.
+- Keep the community repo idea source-ported rather than copied wholesale:
+  persistent request slots remain our slot-map path, draft reads already consume
+  those slots, and this pass makes the ragged write path GPU-resident.
+
+Implementation summary:
+
+- Added `dspark_store_main_kv_ragged` with CPU reference and Triton
+  implementation. Inputs are flat projected KV, flat positions,
+  `query_start_loc`, valid per-request lengths, and optional request-stable
+  slot indices.
+- Added `prefill_main_ragged()` through `DeepSeekV4DSpark` and
+  `DeepSeekV4DSparkModel`, then routed ragged target-context batches from
+  `DSparkProposer` into the new store path.
+- Changed mixed prefill+decode preparation to derive raw lengths, valid
+  lengths, last hidden states, and last positions from GPU tensors. It no
+  longer groups same-length chunks in Python for the hot ragged path.
+
+Validation:
+
+- Host syntax/lint:
+  `py_compile` passed for `dspark_proposer.py`, `dspark.py`,
+  `dspark_kernels.py`, and `test_dspark.py`; `ruff check` passed.
+- Clean rebuilt container focused pytest on head:
+  `/tmp/test_dspark.py -k 'ragged or store_main_kv or condense or request_stable'`
+  passed `10 passed, 73 deselected`.
+- Same focused pytest on worker passed `10 passed, 73 deselected`.
+- Real-model smoke, `max_tokens=1024`, `MAX_NUM_SEQS=8`:
+  static c8 passed at `131.64` aggregate tok/s, `37.28%` acceptance,
+  `1.864` accepted/draft.
+- Real-model staggered c8 passed at `126.60` aggregate tok/s, `35.33%`
+  acceptance, `1.767` accepted/draft.
+- Grounded condense victim under churn passed:
+  `byte_for_byte_match=true`, expected payload matched for both reference and
+  victim, `30` churn requests, `0` churn errors.
+
+Three-run 1024-token single-stream result:
+
+| config | server tok/s | acceptance | accepted/draft | cycle ms |
+| --- | ---: | ---: | ---: | ---: |
+| request-stable slot pullback | `61.50 +/- 2.81` | `70.88%` | `3.544` | n/a |
+| flat ragged main-KV store | `63.46 +/- 1.56` | `73.54%` | `3.677` | `73.71` |
+
+Benchmark files:
+
+- `single_stream_interactive_262k_window_ragged_flat_kernel1024_20260629_125041_run*.json`
+
+Interpretation:
+
+- The flat ragged store path is a correctness and mixed-batch overhead cleanup.
+  It does not significantly move single-stream decode throughput, as expected:
+  single-stream uses the uniform path most of the time and still spends the
+  cycle in target verification plus DSpark draft/logit work.
+- The real single-stream signal remains healthy acceptance (`95.0%` first-token
+  acceptance, `85.1%` mean suffix conditional acceptance) with about
+  `13.57` DSpark cycles/s. That points back to cycle-time reduction rather than
+  proposer-side correctness plumbing as the next speed lever.
+- Logs still showed inference-time JIT for `_pack_topk_routes_prefix_kernel` and
+  `_pack_topk_routes_post_prefix_kernel` during the condense/churn smoke. Add or
+  widen warmup coverage for those exact churn/static shapes before treating
+  TTFC or first-request latency as final.
+- Goal remains active: this pass did not produce the required significant
+  decode-speed improvement. The next grounded target is still draft-side fusion,
+  low-latency Markov/global top-1 handling, sparse-attention/projection fusion,
+  or a profiling result that isolates one of those as the blocking kernel.
+
+## Flat-Ragged Timing Diagnostic, 2026-06-29
+
+Purpose:
+
+- Re-run timing diagnostics after the flat ragged main-KV store pullback so the
+  next optimization is grounded in the current implementation, not pre-pullback
+  timing.
+- Use existing opt-in diagnostics only; no code changes were made for this
+  measurement. The server was restored to timing-off afterward.
+
+Run:
+
+- Diagnostic env:
+  `VLLM_DSPARK_ITER_TIMING=1`,
+  `VLLM_DSPARK_STAGE_TIMING=1`,
+  `VLLM_DSPARK_TARGET_TIMING=1`, all with `LOG_EVERY=10`.
+- Benchmark:
+  `single_stream_interactive_262k_window_timing_flatragged512_20260629_130614_run1.json`
+  with `SCENARIO=code_completion`, `PROMPT_TOKENS=512`, `MAX_TOKENS=512`,
+  `thinking=false`, and one warmup request.
+- Captured logs:
+  `timing_flatragged512_20260629_head.log` and
+  `timing_flatragged512_20260629_worker.log`.
+
+Observed request metrics:
+
+- Diagnostic server tok/s: `58.75`; not a speed gate because the timing path
+  synchronizes CUDA.
+- Draft acceptance: `70.18%`.
+- Accepted/draft: `3.509`.
+- First-token acceptance: `92.98%`.
+- Mean suffix conditional acceptance: `82.34%`.
+
+Late cumulative timing, head rank, over `230` iterations:
+
+| stage | avg ms |
+| --- | ---: |
+| `target_forward` | `72.969` |
+| `draft_propose` | `12.342` |
+| `target_postprocess_logits` | `2.590` |
+| `execute_preprocess` | `1.976` |
+| `sample_reject` | `0.221` |
+| `iter_total` | `90.624` |
+
+Late cumulative timing, worker rank, over `230` iterations:
+
+| stage | avg ms |
+| --- | ---: |
+| `target_forward` | `72.638` |
+| `draft_propose` | `12.358` |
+| `target_postprocess_logits` | `2.580` |
+| `execute_preprocess` | `2.179` |
+| `sample_reject` | `0.224` |
+| `iter_total` | `90.521` |
+
+Proposer-stage timing at the same point:
+
+| rank | `prefill_main` | `draft` | proposer `total` |
+| --- | ---: | ---: | ---: |
+| head | `0.791 ms` | `10.926 ms` | `12.052 ms` |
+| worker | `0.917 ms` | `10.794 ms` | `12.084 ms` |
+
+Interpretation:
+
+- The current flat-ragged implementation has isolated the next blocker:
+  target verification remains the dominant term at roughly `72.8 ms`, while
+  the whole DSpark proposal path is about `12.1 ms`.
+- `prefill_main`/main-KV update is below `1 ms`; the ragged CPU/index bridge is
+  no longer a material single-stream bottleneck.
+- `VLLM_DSPARK_TARGET_TIMING=1` was present in both containers but emitted no
+  target-layer breakdown. That indicates the target forward is being replayed
+  through the captured/compiled path where Python-layer target timers do not
+  fire. For finer target attribution, use profiler/NVTX/CUDA-graph scopes
+  rather than Python-layer timers.
+- The highest-value next implementation target is now a verifier-side or
+  overlap target, not another proposer metadata change:
+  1. prove and prototype draft/verify overlap, aiming to hide as much of the
+     `~12 ms` proposal path behind the `~73 ms` target forward as possible;
+  2. profile the captured target graph with NVTX/torch profiler to split the
+     `~73 ms` verifier term across sparse MLA, MoE, MHC, and DSpark feature
+     capture;
+  3. only pursue Markov/output-head replication/fusion if the expected
+     `~0.2-2 ms` draft-side reduction is useful relative to the larger
+     verifier term.
+
+## Target Graph Torch Profile, 2026-06-29
+
+Goal:
+
+- Split the captured target/verifier graph with lower-level profiler evidence
+  after Python target timers failed to fire during CUDA graph replay.
+- Keep the measurement grounded in the current flat-ragged DSpark build.
+
+Command:
+
+```bash
+MAX_TOKENS=1024 PROFILE_MAX_ITERATIONS=24 PROFILE_ACTIVE_ITERATIONS=8 \
+  bash scripts/run_dspark_torch_profile.sh target_graph_profile
+```
+
+Artifacts:
+
+- `experiments/dspark-benchmarks/profiles/target_graph_profile_20260629_132139/head/profiler_out_0.txt`
+- `experiments/dspark-benchmarks/profiles/target_graph_profile_20260629_132139/worker/profiler_out_0.txt`
+- `experiments/dspark-benchmarks/profiles/target_graph_profile_20260629_132139/head/*.pt.trace.json`
+- `experiments/dspark-benchmarks/profiles/target_graph_profile_20260629_132139/worker/*.pt.trace.json`
+- `single_stream_interactive_262k_window_target_graph_profile_profiled_20260629_132139_run1.json`
+
+Profiled request:
+
+- `max_tokens=1024`, single stream, profiler active after warmup.
+- Server decode rate under profiler: `61.68 tok/s`; approximate client decode
+  rate: `61.50 tok/s`.
+- Acceptance: `71.29%`; accepted/draft: `3.564`; scheduled draft length: `5.0`.
+
+CUDA-time evidence, rank 0 / rank 1:
+
+| bucket | rank 0 self CUDA | rank 1 self CUDA | note |
+| --- | ---: | ---: | --- |
+| B12X W4A16 MoE fused kernel | `250.5 ms` | `249.8 ms` | largest single kernel bucket |
+| DeepGEMM fp8/fp4 GEMMs | `92.8 ms` | `92.5 ms` | multiple dense/expert projections |
+| CUTLASS bf16/s1616 GEMMs | `89.4 ms` | `89.1 ms` | dense GEMM bucket |
+| B12X dense GEMMs | `58.3 ms` | `58.6 ms` | dense projection kernels |
+| NCCL all-reduce | `56.8 ms` | `31.4 ms` | material but smaller than GEMM/MoE |
+| MHC kernels | `15.0 ms` | `14.9 ms` | not the dominant term |
+| FlashInfer sparse MLA decode | `8.5 ms` | `8.7 ms` | not the dominant term |
+| DSpark draft sparse attention | `7.1 ms` | `7.1 ms` | draft-side only |
+| Route packing | `7.6 ms` | `7.5 ms` | small but visible |
+
+Interpretation:
+
+- This confirms the previous stage timing: the next large blocker sits inside
+  the captured verifier/target forward, not in the flat ragged main-KV update.
+- The largest concrete kernel family is target-side B12X W4A16 MoE, followed
+  by dense fp8/fp4/BF16 GEMMs. Sparse MLA and MHC are much smaller on this
+  single-stream profile, so they are not the first custom-kernel target for a
+  large decode-speed win.
+- NCCL all-reduce is visible but not large enough by itself to explain a
+  `>25%` gap. It remains a secondary opportunity or overlap target.
+- Broad custom profiler scopes overlap under captured CUDA graphs and can
+  exceed total self CUDA. Treat individual kernel rows as the primary evidence.
+- Claude advisor caveat: the table still mixes the profiled active window's
+  graph-replayed CUDA work, and scope rows should not be divided directly into
+  wall-time stages. The more actionable mismatch is draft stage wall time
+  (`~12 ms` from synchronization timing) versus much smaller draft GPU work in
+  the profiler, which points to PIECEWISE graph/Python/launch/NCCL gaps in the
+  draft path.
+
+Next implementation direction:
+
+1. Run an Nsight Systems CUDA-profiler-range timeline for the draft path and
+   the full decode loop to identify PIECEWISE graph gaps, Markov-loop launches,
+   NCCL waits, and Python intervals inside the measured `~12 ms` draft wall
+   term.
+2. Keep draft/verify overlap as the major parity-preserving lever: hiding the
+   `~12 ms`
+   draft block behind target work can help without changing draft quality.
+3. If pursuing custom verifier kernels, start with NCU on the target-side
+   B12X W4A16 MoE and dense GEMM kernels at the single-stream decode shape.
+4. Do not prioritize sparse MLA/MHC micro-optimizations first for
+   single-stream; the measured upper bound is too small relative to MoE/GEMM.
+
+## Post-Profile Restore Smoke, 2026-06-29
+
+After the torch-profiler run, the normal non-profiler DSpark stack was
+restarted from `vllm-dspark-runtime:clean`.
+
+Validation:
+
+- `/health` returned 200.
+- `/v1/models` reported `deepseek-v4-flash-dspark` with `max_model_len=262144`.
+- API logs reached `Application startup complete`.
+- `VLLM_CUSTOM_SCOPES_FOR_PROFILING=0`; DSpark timing flags are present but
+  disabled with `=0`; `VLLM_EXTRA_ARGS` is empty.
+
+Restore smoke artifact:
+
+- `single_stream_interactive_262k_window_restore_smoke_20260629_133958_run1.json`
+
+Restore smoke metrics:
+
+- `max_tokens=1024`, single stream, `thinking=false`, `ignore_eos=true`.
+- Server decode rate: `72.83 tok/s`; approximate client decode rate:
+  `72.40 tok/s`; end-to-end output rate: `66.72 tok/s`.
+- Acceptance: `86.42%`; accepted/draft: `4.321`; scheduled draft length:
+  `5.0`; prune rate: `0.0`.
+
+Interpretation:
+
+- The restored production-like experimental server is healthy and faster than
+  the profiler-instrumented request, as expected.
+- This is a sanity datapoint, not a goal-completing benchmark. The current
+  speed goal still needs repeated before/after evidence after the next
+  implementation change.
+
+## Nsight Systems Decode Timeline, 2026-06-29
+
+Goal:
+
+- Replace the broad torch-profiler interpretation with a CUDA-profiler-range
+  timeline around one warmed 1024-token decode request.
+- Specifically test whether the `~12 ms` draft wall term is mostly launch/Python
+  gap, a short CUDA graph replay, or overlap headroom.
+
+Command:
+
+```bash
+MAX_TOKENS=1024 PROMPT_TOKENS=512 \
+  bash scripts/run_dspark_nsys_profile.sh draft_timeline_nsys
+```
+
+Artifacts:
+
+- `scripts/run_dspark_nsys_profile.sh`
+- `scripts/summarize_dspark_nsys.py`
+- `compose/docker-compose.dspark-nsys.yml`
+- `entrypoints/entrypoint.dspark-nsys-launch.sh`
+- `experiments/dspark-benchmarks/profiles/draft_timeline_nsys_20260629_135000/head/*.nsys-rep`
+- `experiments/dspark-benchmarks/profiles/draft_timeline_nsys_20260629_135000/head/*.sqlite`
+- `experiments/dspark-benchmarks/profiles/draft_timeline_nsys_20260629_135000/worker/*.nsys-rep`
+- `experiments/dspark-benchmarks/profiles/draft_timeline_nsys_20260629_135000/worker/*.sqlite`
+- `experiments/dspark-benchmarks/profiles/draft_timeline_nsys_20260629_135000/summary.txt`
+- `single_stream_interactive_262k_window_draft_timeline_nsys_nsys_profiled_20260629_135000_run1.json`
+
+Profiled request:
+
+- `max_tokens=1024`, single stream, CUDA-profiler range started after a warmup
+  request.
+- Server decode rate under nsys: `62.22 tok/s`; approximate client decode rate:
+  `62.04 tok/s`.
+- Acceptance: `75.44%`; accepted/draft: `3.772`; scheduled draft length: `5.0`.
+
+Timeline evidence, head / worker:
+
+| metric | head | worker | interpretation |
+| --- | ---: | ---: | --- |
+| CUDA graph launches | `868` | `868` | two graph replays per visible generation unit |
+| CUDA graph sum | `31.12 s` | `31.16 s` | dominant captured wall time |
+| short graph bucket `5-20 ms` | `435`, `4.62 s`, `10.63 ms mean` | `435`, `4.65 s`, `10.69 ms mean` | draft-side sized graph replay |
+| long graph bucket `40-80 ms` | `433`, `26.50 s`, `61.20 ms mean` | `433`, `26.51 s`, `61.23 ms mean` | verifier/target-sized replay |
+| graph pair mean | `71.71 ms` | `71.80 ms` | roughly short+long serialized |
+| graph gap p50 | `3.87 ms` | `3.96 ms` | launch gap exists but is not the main term |
+| generation NVTX sum | `1.60 s` | `1.36 s` | CPU-side annotated execution is small vs graph replay |
+| `cudaStreamSynchronize` sum | `28.00 s` | `28.10 s` | CPU waits mostly reflect graph replay completion |
+
+Kernel buckets from the same nsys window:
+
+| bucket | head | worker | note |
+| --- | ---: | ---: | --- |
+| CUTLASS bf16/s1616 GEMM | `1025.3 ms` | `980.1 ms` | largest concrete kernel bucket |
+| B12X W4A16 MoE fused | `506.2 ms` | `501.8 ms` | next largest custom-kernel bucket |
+| DeepGEMM fp8/fp4 | `224.0 ms` | `223.0 ms` | dense/expert projection bucket |
+| NCCL all-gather | `30.8 ms` | `91.9 ms` | rank-asymmetric, secondary |
+| NCCL all-reduce | `58.9 ms` | `62.6 ms` | visible but not first-order |
+| FlashInfer sparse MLA | `24.0 ms` | `23.7 ms` | not a primary speed lever |
+| MHC | `28.7 ms` | `28.3 ms` | not a primary speed lever |
+
+Interpretation:
+
+- The draft path is not mainly an unaccounted Python/index bridge anymore. It
+  appears as a real short CUDA graph replay averaging `~10.6 ms`.
+- Draft/verify overlap remains worthwhile, but the measured upper bound is now
+  clearer: fully hiding the short graph under the long graph would reduce a
+  `~71.8 ms` pair toward `~61.2 ms`, roughly a `15-17%` ceiling before
+  secondary gaps. That is useful but probably insufficient alone for a `>25%`
+  goal.
+- The long verifier graph is the next blocker for a large single-stream speed
+  gain. The strongest concrete kernel targets remain CUTLASS BF16/s1616 GEMM,
+  B12X W4A16 MoE, and DeepGEMM fp8/fp4, not sparse MLA/MHC.
+- Graph launch gaps are small (`~4 ms p50` between graph replays), so
+  PIECEWISE-to-FULL launch consolidation alone is unlikely to produce the large
+  win unless it also enables overlap or removes synchronization.
+- CUDA runtime synchronization totals should be read as CPU wait for replayed
+  graph work, not as an independent CPU-hot-path regression.
+
+Next implementation direction:
+
+1. Keep draft/verify overlap as a bounded, parity-preserving win, but do not
+   expect it alone to clear a `>25%` gate.
+2. Run NCU or focused microbenchmarks on the long graph's largest concrete
+   buckets: CUTLASS BF16/s1616 GEMM, B12X W4A16 MoE, and DeepGEMM fp8/fp4 at
+   the single-stream decode shapes.
+3. Investigate whether the long graph can avoid the large CUTLASS BF16 path or
+   route it through a Blackwell/GB10-tuned kernel/tactic.
+4. Treat sparse MLA/MHC custom work as secondary until the long verifier graph
+   is reduced.
+
+## Target-Tail Timing Probe, 2026-06-29
+
+Goal:
+
+- Ground the "draft/verify overlap is hard" discussion in measured dependency
+  timing instead of treating it as an excuse to stop.
+- Measure how much work exists after target forward completes but before the
+  next DSpark draft can legally start from the current integration.
+
+Runtime:
+
+- Clean timing-probe image on both ranks:
+  `sha256:564f01f71d2ff994bd6fdb23cf5a49732412f651ad58e50260796572cb098f34`.
+- Diagnostic env enabled on both ranks:
+  `VLLM_DSPARK_ITER_TIMING=1`, `VLLM_DSPARK_STAGE_TIMING=1`,
+  log every `20` iterations.
+- `VLLM_DSPARK_DRAFT_STREAM=1` was present in the preset, but the runtime
+  disabled the draft stream because iteration timing synchronizes CUDA stages.
+  This was intentional for the dependency probe.
+
+Artifact:
+
+- `single_stream_interactive_262k_window_tailprobe_iter_timing_20260629_171718_run1.json`
+
+Request:
+
+- `max_tokens=1024`, single stream, `PROMPT_TOKENS=512`,
+  `SCENARIO=code_completion`, `thinking=false`, `ignore_eos=true`.
+
+Benchmark result:
+
+- Server decode rate: `60.14 tok/s`; approximate client decode rate:
+  `59.90 tok/s`; end-to-end output rate: `58.35 tok/s`.
+- Acceptance: `71.70%`; accepted/draft: `3.585`; scheduled draft length:
+  `5.0`; prune rate: `0.0`.
+- This is diagnostic timing with CUDA synchronization, not a clean throughput
+  gate.
+
+Stable timing evidence, head / worker:
+
+| metric at 440 iterations | head | worker | interpretation |
+| --- | ---: | ---: | --- |
+| `target_forward` | `66.387 ms` | `66.609 ms` | dominant serialized verifier work |
+| `target_postprocess_logits` | `2.587 ms` | `2.634 ms` | main legal tail after target forward |
+| `sample_reject` | `0.288 ms` | `0.199 ms` | rejection is small |
+| `state_update` | `0.024 ms` | `0.022 ms` | negligible |
+| `target_forward_done_to_draft_start` | `3.097 ms` | `3.027 ms` | total currently legal tail window |
+| `draft_propose` | `11.791 ms` | `11.859 ms` | proposal wall term |
+| draft stage `total` | `11.554 ms` | `11.637 ms` | proposer stage timing |
+| draft graph | `10.439 ms` | `10.576 ms` | real draft GPU graph |
+| `iter_total` | `83.276 ms` | `83.293 ms` | synchronized diagnostic iteration |
+
+Interpretation:
+
+- The existing draft-stream/deferred-fence path can hide at most the
+  post-target tail visible in the current graph shape, about `3.0-3.1 ms`.
+  That aligns with the previously measured modest `~2%` throughput gain.
+- The full draft graph is still `~10.4-10.6 ms`, so hiding the whole draft
+  under verifier work is not legal from the current launch point.
+- Because DSpark consumes target layers `40,41,42` of a `43`-layer target and
+  the integration exposes those rows after target forward, the large overlap
+  path needs one of:
+  a target graph split/event at the DSpark feature write,
+  an optimistic double-buffered branch that does not mutate canonical KV before
+  commit, or verifier-kernel speedups in the long graph.
+- "Overlap is hard" is therefore the wrong framing. The current blocker is a
+  dependency boundary: starting draft earlier would read unavailable target
+  features or commit speculative KV incorrectly. The next step is to move that
+  boundary, not abandon the overlap direction.
+
+Next implementation direction:
+
+1. Keep `VLLM_DSPARK_DRAFT_STREAM=1` as the default experimental scaffold.
+2. Prototype the earliest safe feature-ready event inside the target graph, if
+   vLLM's graph capture can expose it without breaking graph stability.
+3. In parallel, sketch an optimistic double-buffered DSpark draft state where
+   the optimistic path is discarded unless verifier acceptance confirms the
+   assumed committed prefix.
+4. Continue NCU/focused work on the long verifier graph's largest buckets:
+   CUTLASS BF16/s1616 GEMM, B12X W4A16 MoE, and DeepGEMM fp8/fp4.
+
+Restored timing-off control:
+
+- After the probe, the server was restarted with
+  `VLLM_DSPARK_ITER_TIMING=0`, `VLLM_DSPARK_STAGE_TIMING=0`, and
+  `VLLM_DSPARK_DRAFT_STREAM=1`.
+- Health returned `200` and logs showed `Application startup complete` on
+  `0.0.0.0:8000`.
+- Control artifact:
+  `single_stream_interactive_262k_window_tailprobe_restore_smoke_20260629_172512_run1.json`.
+- Result: server decode `63.62 tok/s`, approximate client decode
+  `63.56 tok/s`, end-to-end output `61.81 tok/s`, `1023` output tokens from a
+  `max_tokens=1024` request.
+- DSpark quality: acceptance `73.42%`, accepted/draft `3.671`, scheduled draft
+  length `5.0`, `219` drafts.
+
+## Draft-Stream CUDA Graph Pool Isolation, 2026-06-29
+
+Goal:
+
+- Remove a correctness risk before deeper draft/verify overlap work:
+  `CUDAGraphWrapper` used the global graph pool while DSpark draft replay can
+  run on a dedicated CUDA stream.
+
+Implementation:
+
+- `CUDAGraphWrapper` now accepts an explicit graph-pool override while keeping
+  the previous global-pool default for normal serial replay.
+- `DSparkProposer.initialize_cudagraph_keys()` allocates a dedicated graph pool
+  for the DSpark draft graph only when the runner has
+  `VLLM_DSPARK_DRAFT_STREAM=1` active.
+- This does not move the draft launch earlier and is not counted as a
+  throughput improvement. It makes the current draft-stream scaffold safer for
+  future graph-captured overlap experiments.
+
+Validation:
+
+- Disposable runtime-container compile check: passed for the edited wrapper,
+  proposer, and focused tests.
+- Focused tests:
+  `tests/v1/spec_decode/test_dspark.py -k 'draft_graph_pool or pending_event or target_tail'`
+  passed: `3 passed`.
+- Focused CUDA graph wrapper test:
+  `tests/v1/cudagraph/test_cudagraph_dispatch.py -k explicit_graph_pool`
+  passed: `1 passed`.
+- Full DSpark speculative suite passed:
+  `tests/v1/spec_decode/test_dspark.py`: `81 passed, 13 skipped`.
+- `git diff --check` passed in the vLLM fork.
+- The currently running server was left untouched and `/health` remained OK;
+  it does not include this source change until the image is rebuilt.
+
+## DSpark Prefill Projection Split, 2026-06-29
+
+Goal:
+
+- Create a source-level boundary between DSpark target-context projection and
+  canonical main-KV mutation. This supports the overlap goal because projection
+  is non-mutating work, while the store path is the correctness-critical commit
+  point for request-stable DSpark cache slots.
+
+Implementation:
+
+- `DeepSeekV4DSpark.project_main_context()` now projects target hidden rows
+  without writing the DSpark cache.
+- `prefill_main_projected()` and `prefill_main_ragged_projected()` take the
+  projected tensor and perform the existing uniform/ragged main-KV writes with
+  request-slot indices preserved.
+- `DSparkProposer.propose()` now times the split as `prefill_project` followed
+  by `prefill_main`. The launch order is intentionally unchanged for this
+  checkpoint, and the proposer falls back to the old combined calls if the
+  model does not expose the split methods.
+
+Validation:
+
+- Focused runtime-container tests passed for uniform/ragged projection split
+  and stable-slot behavior: `4 passed`.
+- Full DSpark speculative suite passed after the split:
+  `tests/v1/spec_decode/test_dspark.py`: `83 passed, 13 skipped`.
+- Disposable runtime-container compile check passed for the edited DSpark
+  model, proposer, and test file.
+- This is not counted as a speedup. It is the next legal boundary for moving
+  non-mutating work to a stream/event path or for wiring a target feature-ready
+  split later without changing acceptance semantics.
+
+## DSpark Draft-Stream Preprojection, 2026-06-29
+
+Goal:
+
+- Move the first non-mutating DSpark proposal substage earlier in the pipeline
+  without changing verifier acceptance, request-slot mapping, or canonical
+  DSpark main-KV commit semantics.
+
+Implementation:
+
+- The experiment moved DSpark target-context projection onto the draft stream
+  after target logits were computed, then reused that projected tensor during
+  proposal when shapes matched.
+- Only projection moved earlier. Main-KV store and draft graph replay still
+  waited for rejection/commit metadata, so this was a bounded pipeline step
+  rather than full draft/verify overlap.
+- Added profiler/NVTX-friendly scopes for proposer stages:
+  `dspark_proposer: context_prepare`, `prefill_project`, `prefill_main`,
+  `graph_prepare`, `draft`, and `postprocess`.
+
+Validation:
+
+- Disposable runtime-container compile check passed for the edited proposer,
+  GPU model runner, and tests.
+- Focused tests covering profiler scopes, preprojection reuse, projection
+  split, stable slots, draft-stream lifecycle, target-tail timing, and
+  graph-pool isolation passed during the now-reverted experiment:
+  `10 passed, 104 deselected`.
+- Clean overlay image was rebuilt on both nodes and tested on the real TP=2
+  stack.
+- Real-model A/B result with the preprojection path active was a regression:
+  `single_stream_interactive_262k_window_preproject_draftstream_1024_20260629_181906_run*.json`
+  measured `52.65 +/- 1.25` server tok/s over three `max_tokens=1024` runs,
+  with acceptance `72.21%` and accepted/draft `3.611`. Recent draft-stream
+  controls were in the `~59-64` tok/s band.
+- Conclusion: early projection likely contended with the verifier/sampler
+  stream more than it hid useful work at this shape. The active branch removed
+  the preprojection code and flag; git history retains the experiment if it
+  ever needs to be inspected.

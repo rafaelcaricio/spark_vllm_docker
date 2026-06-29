@@ -35,6 +35,14 @@ It does **not** contain actual Hugging Face model weights.
 > or context. See
 > [`docs/deepseek-v4-prefill8192-validated-candidate.md`](../docs/deepseek-v4-prefill8192-validated-candidate.md).
 
+> **DeepSeek-V4-Flash-DSpark 262k canonical experiment lane:**
+> `dspark-v4-flash-262k-canonical.env` is the reduced-flag baseline for current
+> DSpark speed work. It keeps settled speed-path choices in the preset, defaults
+> `VLLM_DSPARK_DRAFT_STREAM=1` for ongoing pipeline work, and moves diagnostics,
+> failed toggles, forced-length sweeps, and scheduler work into explicit shell
+> overrides. See
+> [`experiments/dspark_flag_matrix.md`](../experiments/dspark_flag_matrix.md).
+
 ## What these files are
 
 Each `.env` file in this directory defines model-specific runtime settings passed to

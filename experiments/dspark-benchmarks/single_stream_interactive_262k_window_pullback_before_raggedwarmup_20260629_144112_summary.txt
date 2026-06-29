@@ -1,0 +1,13 @@
+single_stream_interactive_262k_window_pullback_before_raggedwarmup_20260629_144112_run1.json: mode=single_stream c=1 server_tok_s=63.512465 draft_acceptance=0.740367 accepted_per_draft=3.701835 cycle_ms=74.030 first=0.949541 suffix=0.856573
+single_stream_interactive_262k_window_pullback_before_raggedwarmup_20260629_144112_run2.json: mode=single_stream c=1 server_tok_s=61.901846 draft_acceptance=0.713393 accepted_per_draft=3.566964 cycle_ms=73.778 first=0.928571 suffix=0.851466
+single_stream_interactive_262k_window_pullback_before_raggedwarmup_20260629_144112_run3.json: mode=single_stream c=1 server_tok_s=63.642764 draft_acceptance=0.745622 accepted_per_draft=3.728111 cycle_ms=74.291 first=0.963134 suffix=0.858017
+aggregate:
+  server_tok_s: mean=63.019025 stdev=0.969697 cv=0.015387 ci95=±2.409055 min=61.901846 max=63.642764
+  approx_tok_s: mean=62.835353 stdev=1.077985 cv=0.017156 ci95=±2.678079 min=61.599295 max=63.580553
+  draft_acceptance: mean=0.733127 stdev=0.017291 cv=0.023586 ci95=±0.042958 min=0.713393 max=0.745622
+  accepted_per_draft: mean=3.665637 stdev=0.086457 cv=0.023586 ci95=±0.214788 min=3.566964 max=3.728111
+  first_acceptance: mean=0.947082 stdev=0.017412 cv=0.018385 ci95=±0.043257 min=0.928571 max=0.963134
+  suffix_conditional_acceptance: mean=0.855352 stdev=0.003442 cv=0.004024 ci95=±0.008551 min=0.851466 max=0.858017
+  cycle_tokens_est: mean=4.665637 stdev=0.086457 cv=0.018531 ci95=±0.214788 min=4.566964 max=4.728111
+  cycles_per_second_est: mean=13.507596 stdev=0.046881 cv=0.003471 ci95=±0.116468 min=13.460507 max=13.554265
+  cycle_ms_est: mean=74.033011 stdev=0.256959 cv=0.003471 ci95=±0.638374 min=73.777514 max=74.291408
