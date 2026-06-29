@@ -157,6 +157,33 @@ def summarize_points(points: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def filter_points(
+    points: list[dict[str, Any]],
+    *,
+    min_batch_tokens: int,
+    exclude_batch_tokens: set[int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    kept: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+
+    for point in points:
+        batch_tokens = int(point["batch_tokens"])
+        reasons: list[str] = []
+        if min_batch_tokens and batch_tokens < min_batch_tokens:
+            reasons.append(f"batch_tokens<{min_batch_tokens}")
+        if batch_tokens in exclude_batch_tokens:
+            reasons.append("batch_tokens_excluded")
+
+        if reasons:
+            excluded_point = dict(point)
+            excluded_point["exclude_reasons"] = reasons
+            excluded.append(excluded_point)
+        else:
+            kept.append(point)
+
+    return kept, excluded
+
+
 def resolve_paths(patterns: list[str], out_dir: Path) -> list[Path]:
     paths: list[Path] = []
     for pattern in patterns:
@@ -189,6 +216,17 @@ def main() -> None:
         default=DEFAULT_LENGTH_PATTERN,
         help="Regex with one capture group for forced draft length.",
     )
+    parser.add_argument(
+        "--min-batch-tokens",
+        type=int,
+        default=0,
+        help="Drop profile points whose inferred batch-token count is lower.",
+    )
+    parser.add_argument(
+        "--exclude-batch-tokens",
+        default="",
+        help="Comma-separated batch-token counts to exclude from the curve.",
+    )
     parser.add_argument("--output-json", default="")
     args = parser.parse_args()
 
@@ -197,12 +235,24 @@ def main() -> None:
     if not paths:
         raise SystemExit("no benchmark JSON files matched")
 
-    summary = summarize_points(
+    exclude_batch_tokens = {
+        int(item.strip())
+        for item in args.exclude_batch_tokens.split(",")
+        if item.strip()
+    }
+    points, excluded_points = filter_points(
         load_points(
             paths,
             length_pattern=re.compile(args.length_regex),
-        )
+        ),
+        min_batch_tokens=args.min_batch_tokens,
+        exclude_batch_tokens=exclude_batch_tokens,
     )
+    if not points:
+        raise SystemExit("all benchmark JSON files were excluded")
+
+    summary = summarize_points(points)
+    summary["excluded_points"] = excluded_points
 
     print(f"VLLM_DSPARK_SPS_CURVE={summary['curve']}")
     for row in summary["curve_rows"]:
@@ -216,6 +266,14 @@ def main() -> None:
                 stdev=row["steps_per_second_stdev"],
                 cv=cv_text,
                 runs=row["runs"],
+            )
+        )
+    for point in excluded_points:
+        print(
+            "  excluded {file}: B={batch_tokens} reasons={reasons}".format(
+                file=Path(point["file"]).name,
+                batch_tokens=point["batch_tokens"],
+                reasons=",".join(point["exclude_reasons"]),
             )
         )
 

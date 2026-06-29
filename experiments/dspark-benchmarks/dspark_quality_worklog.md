@@ -2159,3 +2159,79 @@ Next step:
   hardware-aware/dynamic prefix scheduler on top of this ragged support, with a
   profiled local SPS curve, then compare c=4/c=8 per-user and aggregate tok/s
   against this compact-ragged checkpoint.
+
+## Hardware-Aware SPS Scheduler Pass, 2026-06-29
+
+Why:
+
+- The DeepSpec/DSpark paper separates fixed draft generation (`gamma=5` for the
+  released DSpark-5 checkpoint) from variable verification length. That means
+  scheduler gains must come from reducing target verification work when the
+  hardware SPS curve says extra verified draft tokens are expensive.
+- The local c=4/c=8 compact ragged path is now stable enough to test this in a
+  real mixed workload instead of a simulated harness.
+
+Implementation and instrumentation:
+
+- Added `scripts/build_dspark_sps_curve.py` support for excluding known-invalid
+  profile points. The B=4 point from forced length 0 was excluded because the
+  draft model still computed the full DSpark block internally, producing only a
+  few measured drafts and an invalid SPS estimate.
+- Enabled the hardware scheduler with a sanitized local curve:
+  `VLLM_DSPARK_SPS_CURVE=8:7.235357,12:7.749286,16:6.334372,20:6.767292,24:7.280485,48:5.396963`
+- Added `vllm:spec_decode_num_drafts_by_draft_length_total` and benchmark
+  parsing for:
+  - `draft_length_histogram`
+  - `mean_scheduled_draft_length`
+  - `scheduled_draft_prune_rate`
+
+MAX_TOKENS=256 results:
+
+| config | concurrency | aggregate tok/s | per-user tok/s | acceptance | accepted/draft | draft tokens/draft |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hardware scheduler | 4 | `125.56` | `31.39` | `61.18%` | `3.05` | `4.98` |
+| compact ragged baseline | 4 | `124.43` | `31.11` | `60.85%` | `3.04` | `5.00` |
+| hardware scheduler | 8 | `151.88` | `18.98` | `63.47%` | `3.10` | `4.88` |
+| compact ragged baseline | 8 | `174.48` | `21.81` | `61.27%` | `3.06` | `5.00` |
+
+MAX_TOKENS=1024 results:
+
+| config | concurrency | aggregate tok/s | per-user tok/s | acceptance | accepted/draft | draft tokens/draft |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hardware scheduler | 4 | `123.96 ± 7.41` | `30.99` | `68.20%` | `3.40` | `4.99` |
+| scheduler off | 4 | `119.41 ± 7.68` | `29.85` | `66.41%` | `3.32` | `5.00` |
+| hardware scheduler | 8 | `156.93 ± 6.88` | `19.62` | `68.80%` | `3.35` | `4.88` |
+| scheduler off | 8 | `184.80 ± 4.71` | `23.10` | `68.52%` | `3.43` | `5.00` |
+
+Metric smoke after the runtime overlay copied the new metrics file:
+
+- `CONCURRENCY=4`, `MAX_TOKENS=128`, hardware scheduler active.
+- Server decode speed: `126.58` aggregate tok/s.
+- Draft-length histogram: `{4: 1, 5: 121}`.
+- Mean scheduled draft length: `4.9918`.
+- Scheduled draft prune rate: `0.16%`.
+
+Interpretation:
+
+- This pass did not produce a decode-speed win. c=4 is roughly flat and c=8
+  regresses versus scheduler-off / compact-ragged controls.
+- The new histogram explains why: under the profiled curve, the scheduler almost
+  always chooses the full five-token DSpark verification length. It is not
+  meaningfully reducing verification work at c=4, and at c=8 the added
+  scheduling/ragged overhead outweighs any small pruning benefit.
+- This is consistent with the paper's load-aware framing: verifying extra tokens
+  has little opportunity cost until the hardware is in a regime where the SPS
+  curve drops enough to compensate for lower accepted-token yield.
+
+Next steps:
+
+- Do not count the current hardware scheduler as a speed milestone.
+- Keep the draft-length histogram metric; it is the right guardrail for future
+  scheduler changes.
+- Reprofile the SPS curve in a higher-pressure regime before changing the
+  scheduler policy: c=8 forced lengths to fill the B=24..48 gap, and c=16 /
+  `MAX_NUM_SEQS=16` if the runtime can support it.
+- Treat confidence calibration and STS-style scaling as quality work only after
+  the scheduler actually chooses shorter prefixes often enough to matter.
+- Pull the derived repo's 1M padded `nvfp4_ds_mla` profile into a separate
+  long-context lane; keep it isolated from this 262k fp8 scheduler path.

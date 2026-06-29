@@ -127,6 +127,19 @@ def metric_delta(before: str, after: str) -> dict[str, Any]:
             position = key.split(marker, 1)[1].split('"', 1)[0]
             accepted_per_pos[position] = after_value - before_value
     delta["spec_decode_accepted_per_pos"] = accepted_per_pos
+
+    drafts_by_length: dict[str, float] = {}
+    prefix = "vllm:spec_decode_num_drafts_by_draft_length_total"
+    for key, after_value in after_values.items():
+        if not key.startswith(prefix):
+            continue
+        before_value = before_values.get(key, 0.0)
+        marker = 'draft_length="'
+        if marker in key:
+            draft_length = key.split(marker, 1)[1].split('"', 1)[0]
+            drafts_by_length[draft_length] = after_value - before_value
+    if drafts_by_length:
+        delta["spec_decode_drafts_by_draft_length"] = drafts_by_length
     return delta
 
 
@@ -144,6 +157,31 @@ def dspark_quality_summary(metrics_delta: dict[str, Any]) -> dict[str, Any]:
             key=lambda item: int(item[0]),
         )
     }
+    drafts_by_length = metrics_delta.get("spec_decode_drafts_by_draft_length") or {}
+    draft_length_histogram = {
+        str(draft_length): float(count)
+        for draft_length, count in sorted(
+            drafts_by_length.items(),
+            key=lambda item: int(item[0]),
+        )
+    }
+    draft_length_histogram_total = sum(draft_length_histogram.values())
+    mean_scheduled_draft_length = (
+        sum(int(length) * count for length, count in draft_length_histogram.items())
+        / draft_length_histogram_total
+        if draft_length_histogram_total > 0.0
+        else None
+    )
+    max_observed_draft_length = max(
+        [int(length) for length in draft_length_histogram]
+        + [len(accepted_counts_by_pos)],
+        default=0,
+    )
+    scheduled_draft_prune_rate = (
+        1.0 - (mean_scheduled_draft_length / max_observed_draft_length)
+        if mean_scheduled_draft_length is not None and max_observed_draft_length > 0
+        else None
+    )
 
     per_position_acceptance = {
         position: (count / drafts if drafts > 0.0 else None)
@@ -174,6 +212,9 @@ def dspark_quality_summary(metrics_delta: dict[str, Any]) -> dict[str, Any]:
         "acceptance_rate": (
             accepted_tokens / draft_tokens if draft_tokens > 0.0 else None
         ),
+        "draft_length_histogram": draft_length_histogram,
+        "mean_scheduled_draft_length": mean_scheduled_draft_length,
+        "scheduled_draft_prune_rate": scheduled_draft_prune_rate,
         "per_position_acceptance": per_position_acceptance,
         "conditional_acceptance_per_position": conditional_acceptance,
         "first_token_acceptance": conditional_acceptance.get("0"),
