@@ -2383,3 +2383,48 @@ Interpretation:
   remaining high-impact work should stay on GPU-resident draft execution,
   fused kernels, and c8/c16 GPU-side prefix selection where pruning can change
   the verification shape.
+
+## Fused Markov Argmax and Next GPU-Offload Check, 2026-06-29
+
+Purpose:
+
+- Test whether the existing Triton fused local Markov argmax moves
+  single-stream decode speed when `VLLM_DSPARK_LOCAL_ARGMAX=1` and
+  `VLLM_DSPARK_REPLICATE_MARKOV_W1=1` are already enabled.
+- Keep the next experiment GPU-resident and avoid adding CPU scheduling work to
+  the single-stream hot path.
+
+Three-run 1024-token result:
+
+| config | server tok/s | acceptance | accepted/draft | cycle ms |
+| --- | ---: | ---: | ---: | ---: |
+| scheduler off baseline | `62.08 ± 0.70` | `69.04%` | `3.452` | `71.71` |
+| fused Markov argmax | `61.75 ± 3.52` | `70.05%` | `3.503` | `72.92` |
+
+Validation:
+
+- Benchmark files:
+  `single_stream_interactive_262k_window_fusedmarkov_argmax1024_20260629_105508_run*.json`.
+- Both ranks logged `DSpark fused Markov argmax is enabled`.
+- No `JIT compilation during inference`, traceback, OOM, or CUDA-out errors
+  appeared in the benchmark log grep.
+
+Interpretation:
+
+- The fused local Markov argmax is flat against baseline. It removes local
+  Markov-logit materialization, but it still performs the required per-position
+  tensor-parallel top-1 reduction because the draft base logits are produced by
+  the sharded target `lm_head`.
+- A `markov_w2` replication-only shortcut is not enough under TP=2. The
+  DeepSpec reference uses full-vocab base logits plus a full-vocab Markov head;
+  our vLLM path has sharded base logits. Removing the Markov-loop TP reduction
+  would require a draft-local replicated output head, a lower-latency GPU
+  top-1 reduction, or another full-corrected-logits path.
+
+Next step:
+
+- Validate opt-in FlashInfer allreduce on SM121/world_size=2 with an explicit
+  `VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB` override. The current clean
+  image disables FlashInfer allreduce because the upstream default threshold
+  table has no GB10 tuned entry; the vLLM patch under test lets an experiment
+  opt into this backend without making it the default.
