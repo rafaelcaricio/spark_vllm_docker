@@ -2350,3 +2350,36 @@ Next GPU-offload direction:
 - For single-stream, the larger remaining lever is draft-side fusion
   (`Markov` loop + argmax/confidence + full draft graph capture), not
   confidence scheduling.
+
+## Full-Prefix Bridge Elision, 2026-06-29
+
+Purpose:
+
+- Remove one remaining CPU/Python handoff from the common DSpark path. When all
+  requests use the full configured draft prefix, the proposer now reports no
+  custom draft lengths and lets vLLM keep the normal fixed-length speculative
+  placeholder path. Only shortened prefixes cross the async scheduler bridge.
+
+Three-run 1024-token result:
+
+| config | server tok/s | acceptance | accepted/draft | cycle ms |
+| --- | ---: | ---: | ---: | ---: |
+| scheduler off baseline | `62.08 ± 0.70` | `69.04%` | `3.452` | `71.71` |
+| full-prefix bridge elision | `61.64 ± 1.86` | `69.43%` | `3.471` | `72.53` |
+
+Validation:
+
+- Benchmark files:
+  `single_stream_interactive_262k_window_fullbridge_elide1024_20260629_104159_run*.json`.
+- No `JIT compilation during inference`, traceback, OOM, or CUDA-out errors
+  appeared in head or worker log grep.
+- Host `py_compile` passed for the edited vLLM files.
+
+Interpretation:
+
+- This is a worthwhile simplification because the default full-prefix path no
+  longer allocates/carries a Python length list through scheduler metadata.
+- It is not a measurable decode-speed win on single-stream 1024-token runs. The
+  remaining high-impact work should stay on GPU-resident draft execution,
+  fused kernels, and c8/c16 GPU-side prefix selection where pruning can change
+  the verification shape.
