@@ -2235,3 +2235,47 @@ Next steps:
   the scheduler actually chooses shorter prefixes often enough to matter.
 - Pull the derived repo's 1M padded `nvfp4_ds_mla` profile into a separate
   long-context lane; keep it isolated from this 262k fp8 scheduler path.
+
+## Screenshot Scaling Verification, 2026-06-29
+
+Prompt:
+
+- External screenshot reported one TP=2 DSpark replica running
+  `MAX_NUM_SEQS=16` with static batching and scaling to `301.2` aggregate
+  tok/s at c16 while acceptance stayed around `0.59-0.61`.
+- We did not know whether those testers had code changes beyond ours, so the
+  first grounded check was to reproduce the configuration on the current branch.
+
+Local scheduler-off reproduction:
+
+| concurrency | aggregate tok/s | per-stream tok/s | acceptance | accepted/draft | mean scheduled draft length |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `57.77 ± 2.06` | `57.77` | `0.6501` | `3.250` | `5.000` |
+| 2 | `86.14 ± 5.84` | `43.07` | `0.6176` | `3.088` | `5.000` |
+| 4 | `132.24 ± 7.70` | `33.06` | `0.6268` | `3.134` | `5.000` |
+| 8 | `197.19 ± 10.58` | `24.65` | `0.6229` | `3.114` | `5.000` |
+| 16 | `319.37 ± 6.72` | `19.96` | `0.6233` | `3.116` | `5.000` |
+
+Focused c16 hardware-scheduler check with the earlier B<=48 SPS curve:
+
+| mode | aggregate tok/s | per-stream tok/s | acceptance | accepted/draft | mean scheduled draft length | prune rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| scheduler off | `319.37 ± 6.72` | `19.96` | `0.6233` | `3.116` | `5.000` | `0.0000` |
+| hardware scheduler | `282.43 ± 31.52` | `17.65` | `0.6183` | `3.088` | `4.995` | `0.0010` |
+
+Interpretation:
+
+- The screenshot's scaling result reproduces on our code by moving the serving
+  regime to `MAX_NUM_SEQS=16`; no unknown code change is required to explain
+  the c16 aggregate throughput.
+- DSpark acceptance remains stable under high concurrency, so draft quality is
+  not the blocker in this regime.
+- The hardware scheduler still does not help. The c16 histogram had only
+  `8` pruned drafts out of `3022`; almost everything stayed at length 5.
+- The old SPS curve is insufficient for c16 because it only reaches B=48, while
+  c16 full verification operates in the B=96 region.
+
+Next step:
+
+- Profile c16 forced verification lengths to build a B=32/48/64/80/96 SPS
+  curve, then retest hardware scheduling against that c16-grounded curve.
