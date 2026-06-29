@@ -13,7 +13,7 @@ health_url="${HEALTH_URL:-http://127.0.0.1:8000/health}"
 bench_env=(
   "SCENARIO=${SCENARIO:-code_completion}"
   "PROMPT_TOKENS=${PROMPT_TOKENS:-512}"
-  "MAX_TOKENS=${MAX_TOKENS:-256}"
+  "MAX_TOKENS=${MAX_TOKENS:-1024}"
   "THINKING=${THINKING:-false}"
   "STABLE_PROMPT=${STABLE_PROMPT:-1}"
 )

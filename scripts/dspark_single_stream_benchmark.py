@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="deepseek-v4-flash-dspark")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--prompt-tokens", type=int, default=200_000)
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument(
