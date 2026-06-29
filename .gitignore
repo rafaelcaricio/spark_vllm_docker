@@ -35,7 +35,9 @@ experiments/dspark-benchmarks/*.metrics.before.txt
 experiments/dspark-benchmarks/*.metrics.after.txt
 experiments/dspark-benchmarks/*.log
 experiments/dspark-benchmarks/*.stdout.txt
+experiments/dspark-benchmarks/*_server_env.txt
 experiments/dspark-benchmarks/profiles/
+.env.dspark-experiment.*.bak
 *.ncu-rep
 *.nsys-rep
 *.qdrep
